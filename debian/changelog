@@ -1,3 +1,65 @@
+bcachefs-tools (1:1.31.2~3) unstable; urgency=medium
+
+  * Debian packaging: depend on linux-headers-generic, it will pull in the right one
+
+ -- Roman Lebedev <lebedev.ri@gmail.com>  Sat, 20 Sep 2025 21:18:15 +0300
+
+bcachefs-tools (1:1.31.2) UNRELEASED; urgency=medium
+
+  * DKMS now works on 6.16
+
+ -- Kent Overstreet <kent.overstreet@linux.dev>  Fri, 19 Sep 2025 02:30:19 -0400
+
+bcachefs-tools (1:1.31.1~1) unstable; urgency=medium
+
+  * Split DKMS into separate binary package
+
+ -- Roman Lebedev <lebedev.ri@gmail.com>  Thu, 18 Sep 2025 03:01:17 +0300
+
+bcachefs-tools (1:1.31.1) unstable; urgency=medium
+
+  * DKMS support
+
+ -- Kent Overstreet <kent.overstreet@linux.dev>  Wed, 17 Sep 2025 18:31:34 -0400
+
+bcachefs-tools (1:1.31.0) unstable; urgency=medium
+
+  * Fix package, build against vendored deps
+  * Implement apt.bcachefs.org repo
+
+ -- Roman Lebedev <lebedev.ri@gmail.com>  Tue, 16 Sep 2025 12:50:36 +0300
+
+bcachefs-tools (1:1.13.0-1~exp1) experimental; urgency=medium
+
+  * QA Upload
+  * New upstream release
+    - Regenerate dependency patch
+  * New build-dependency: librust-env-logger-dev
+  * New build-dependency: librust-owo-colors-dev
+  * Add missing character in previous changelog entry
+    (s/tom/toml)
+
+ -- Jonathan Carter <jcc@debian.org>  Mon, 06 Jan 2025 12:37:38 +0200
+
+bcachefs-tools (1:1.9.4-1~exp1) experimental; urgency=medium
+
+  * New upstream release
+  * Remove build-dependency on librust-colored-2-dev (no longer needed)
+  * New build-dependencies: librust-rustix-dev, rustfmt,
+                            librust-memoffset-06-dev -> librust-memoffset-dev
+  * Refresh build-deps patch
+  * Add upstream metadata
+  * Remove self from maintaners (orphaning package)
+
+ -- Jonathan Carter <jcc@debian.org>  Sat, 20 Jul 2024 04:19:03 +0200
+
+bcachefs-tools (1:1.9.2-1) experimental; urgency=medium
+
+  * New upstream release
+  * Fix Vcs fields in debian/control
+
+ -- Jonathan Carter <jcc@debian.org>  Thu, 11 Jul 2024 15:01:59 +0200
+
 bcachefs-tools (1:1.9.1-1) unstable; urgency=medium
 
   * New upstream release

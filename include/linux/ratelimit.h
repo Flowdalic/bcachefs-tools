@@ -9,24 +9,29 @@
 #define DEFAULT_RATELIMIT_BURST		10
 
 /* issue num suppressed message on exit */
-#define RATELIMIT_MSG_ON_RELEASE	1
+#define RATELIMIT_MSG_ON_RELEASE	BIT(0)
+#define RATELIMIT_INITIALIZED		BIT(1)
 
 struct ratelimit_state {
 	raw_spinlock_t	lock;		/* protect the state */
 
 	int		interval;
 	int		burst;
-	int		printed;
-	int		missed;
+	atomic_t	rs_n_left;
+	atomic_t	missed;
+	unsigned int	flags;
 	unsigned long	begin;
-	unsigned long	flags;
 };
 
-#define RATELIMIT_STATE_INIT(name, interval_init, burst_init) {		\
-		.lock		= __RAW_SPIN_LOCK_UNLOCKED(name.lock),	\
-		.interval	= interval_init,			\
-		.burst		= burst_init,				\
+#define RATELIMIT_STATE_INIT_FLAGS(name, interval_init, burst_init, flags_init) { \
+		.lock		= __RAW_SPIN_LOCK_UNLOCKED(name.lock),		  \
+		.interval	= interval_init,				  \
+		.burst		= burst_init,					  \
+		.flags		= flags_init,					  \
 	}
+
+#define RATELIMIT_STATE_INIT(name, interval_init, burst_init) \
+	RATELIMIT_STATE_INIT_FLAGS(name, interval_init, burst_init, 0)
 
 #define RATELIMIT_STATE_INIT_DISABLED					\
 	RATELIMIT_STATE_INIT(ratelimit_state, 0, DEFAULT_RATELIMIT_BURST)
@@ -35,6 +40,9 @@ struct ratelimit_state {
 									\
 	struct ratelimit_state name =					\
 		RATELIMIT_STATE_INIT(name, interval_init, burst_init)	\
+
+extern int ___ratelimit(struct ratelimit_state *rs, const char *func);
+#define __ratelimit(state) ___ratelimit(state, __func__)
 
 static inline void ratelimit_state_init(struct ratelimit_state *rs,
 					int interval, int burst)
@@ -52,16 +60,43 @@ static inline void ratelimit_default_init(struct ratelimit_state *rs)
 					DEFAULT_RATELIMIT_BURST);
 }
 
+static inline void ratelimit_state_inc_miss(struct ratelimit_state *rs)
+{
+	atomic_inc(&rs->missed);
+}
+
+static inline int ratelimit_state_get_miss(struct ratelimit_state *rs)
+{
+	return atomic_read(&rs->missed);
+}
+
+static inline int ratelimit_state_reset_miss(struct ratelimit_state *rs)
+{
+	return atomic_xchg(&rs->missed, 0);
+}
+
+static inline void ratelimit_state_reset_interval(struct ratelimit_state *rs, int interval_init)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&rs->lock, flags);
+	rs->interval = interval_init;
+	rs->flags &= ~RATELIMIT_INITIALIZED;
+	atomic_set(&rs->rs_n_left, rs->burst);
+	ratelimit_state_reset_miss(rs);
+	raw_spin_unlock_irqrestore(&rs->lock, flags);
+}
+
 static inline void ratelimit_state_exit(struct ratelimit_state *rs)
 {
+	int m;
+
 	if (!(rs->flags & RATELIMIT_MSG_ON_RELEASE))
 		return;
 
-	if (rs->missed) {
-		pr_warn("%s: %d output lines suppressed due to ratelimiting\n",
-			current->comm, rs->missed);
-		rs->missed = 0;
-	}
+	m = ratelimit_state_reset_miss(rs);
+	if (m)
+		pr_warn("%s: %d output lines suppressed due to ratelimiting\n", current->comm, m);
 }
 
 static inline void
@@ -72,13 +107,13 @@ ratelimit_set_flags(struct ratelimit_state *rs, unsigned long flags)
 
 extern struct ratelimit_state printk_ratelimit_state;
 
-extern int ___ratelimit(struct ratelimit_state *rs, const char *func);
-#define __ratelimit(state) ___ratelimit(state, __func__)
-
 #ifdef CONFIG_PRINTK
 
-#define WARN_ON_RATELIMIT(condition, state)			\
-		WARN_ON((condition) && __ratelimit(state))
+#define WARN_ON_RATELIMIT(condition, state)	({		\
+	bool __rtn_cond = !!(condition);			\
+	WARN_ON(__rtn_cond && __ratelimit(state));		\
+	__rtn_cond;						\
+})
 
 #define WARN_RATELIMIT(condition, format, ...)			\
 ({								\

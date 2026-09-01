@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <linux/err.h>
 #include <linux/kernel.h>
 #include <linux/log2.h>
 #include <linux/overflow.h>
@@ -78,6 +79,11 @@ static inline void *krealloc(void *old, size_t size, gfp_t flags)
 	return new;
 }
 
+static inline void *kvrealloc(void *old, size_t size, gfp_t flags)
+{
+	return krealloc(old, size, flags);
+}
+
 static inline void *krealloc_array(void *p, size_t new_n, size_t new_size, gfp_t flags)
 {
 	size_t bytes;
@@ -103,6 +109,8 @@ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
 	((size) != 0 && (n) > SIZE_MAX / (size)				\
 	 ? NULL : kmalloc((n) * (size), flags))
 
+#define kvcalloc(n, size, flags)	kvmalloc_array(n, size, flags|__GFP_ZERO)
+
 #define kvmalloc_array_noprof(...)	kvmalloc_array(__VA_ARGS__)
 
 #define kcalloc(n, size, flags)		kmalloc_array(n, size, flags|__GFP_ZERO)
@@ -110,9 +118,15 @@ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
 #define kfree(p)			free((void *) p)
 #define kzfree(p)			free((void *) p)
 
+DEFINE_FREE(kfree, void *, if (!IS_ERR_OR_NULL(_T)) kfree(_T))
+
 #define kvmalloc(size, flags)		kmalloc(size, flags)
+#define kvmalloc_node_align_noprof(size, align, flags, node)	kmalloc(size, flags)
+#define kvmalloc_noprof(size, flags)	kmalloc(size, flags)
 #define kvzalloc(size, flags)		kzalloc(size, flags)
 #define kvfree(p)			kfree(p)
+
+DEFINE_FREE(kvfree, void *, if (!IS_ERR_OR_NULL(_T)) kvfree(_T))
 
 static inline struct page *alloc_pages_noprof(gfp_t flags, unsigned int order)
 {
@@ -273,6 +287,8 @@ static inline void *vmalloc(unsigned long size)
 {
 	return __vmalloc(size, GFP_KERNEL);
 }
+
+#define vmalloc_noprof(...)	vmalloc(__VA_ARGS__)
 
 static inline void *vzalloc(unsigned long size)
 {

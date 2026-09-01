@@ -7,6 +7,7 @@
 #define _CRYPTO_SHA_H
 
 #include <linux/types.h>
+#include <sodium/crypto_hash_sha256.h>
 
 #define SHA1_DIGEST_SIZE        20
 #define SHA1_BLOCK_SIZE         64
@@ -112,4 +113,9 @@ extern int crypto_sha512_update(struct shash_desc *desc, const u8 *data,
 
 extern int crypto_sha512_finup(struct shash_desc *desc, const u8 *data,
 			       unsigned int len, u8 *hash);
+
+static inline void sha256(const u8 *data, unsigned int len, u8 *out)
+{
+	crypto_hash_sha256(out, data, len);
+}
 #endif

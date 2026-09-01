@@ -11,6 +11,7 @@
 #include <linux/ratelimit.h>
 #include <linux/jiffies.h>
 #include <linux/export.h>
+#include <linux/spinlock.h>
 
 /*
  * __ratelimit - rate limiting
@@ -26,43 +27,78 @@
  */
 int ___ratelimit(struct ratelimit_state *rs, const char *func)
 {
-	int ret;
-
-	if (!rs->interval)
-		return 1;
+	/* Paired with WRITE_ONCE() in .proc_handler().
+	 * Changing two values seperately could be inconsistent
+	 * and some message could be lost.  (See: net_ratelimit_state).
+	 */
+	int interval = READ_ONCE(rs->interval);
+	int burst = READ_ONCE(rs->burst);
+	int ret = 0;
 
 	/*
-	 * If we contend on this state's lock then almost
-	 * by definition we are too busy to print a message,
-	 * in addition to the one that will be printed by
-	 * the entity that is holding the lock already:
+	 * Zero interval says never limit, otherwise, non-positive burst
+	 * says always limit.
 	 */
-	if (!raw_spin_trylock(&rs->lock))
-		return 0;
+	if (interval <= 0 || burst <= 0) {
+		WARN_ONCE(interval < 0 || burst < 0, "Negative interval (%d) or burst (%d): Uninitialized ratelimit_state structure?\n", interval, burst);
+		ret = interval == 0 || burst > 0;
+		if (!(READ_ONCE(rs->flags) & RATELIMIT_INITIALIZED) || (!interval && !burst) ||
+		    !raw_spin_trylock(&rs->lock))
+			goto nolock_ret;
 
-	if (!rs->begin)
+		/* Force re-initialization once re-enabled. */
+		rs->flags &= ~RATELIMIT_INITIALIZED;
+		goto unlock_ret;
+	}
+
+	/*
+	 * If we contend on this state's lock then just check if
+	 * the current burst is used or not. It might cause
+	 * false positive when we are past the interval and
+	 * the current lock owner is just about to reset it.
+	 */
+	if (!raw_spin_trylock(&rs->lock)) {
+		if (READ_ONCE(rs->flags) & RATELIMIT_INITIALIZED &&
+		    atomic_read(&rs->rs_n_left) > 0 && atomic_dec_return(&rs->rs_n_left) >= 0)
+			ret = 1;
+		goto nolock_ret;
+	}
+
+	if (!(rs->flags & RATELIMIT_INITIALIZED)) {
+		rs->begin = jiffies;
+		rs->flags |= RATELIMIT_INITIALIZED;
+		atomic_set(&rs->rs_n_left, rs->burst);
+	}
+
+	if (time_is_before_jiffies(rs->begin + interval)) {
+		int m;
+
+		/*
+		 * Reset rs_n_left ASAP to reduce false positives
+		 * in parallel calls, see above.
+		 */
+		atomic_set(&rs->rs_n_left, rs->burst);
 		rs->begin = jiffies;
 
-	if (time_is_before_jiffies(rs->begin + rs->interval)) {
-		if (rs->missed) {
-			if (!(rs->flags & RATELIMIT_MSG_ON_RELEASE)) {
+		if (!(rs->flags & RATELIMIT_MSG_ON_RELEASE)) {
+			m = ratelimit_state_reset_miss(rs);
+			if (m) {
 				printk(KERN_WARNING
-				       "%s: %d callbacks suppressed\n",
-				       func, rs->missed);
-				rs->missed = 0;
+						"%s: %d callbacks suppressed\n", func, m);
 			}
 		}
-		rs->begin   = jiffies;
-		rs->printed = 0;
 	}
-	if (rs->burst && rs->burst > rs->printed) {
-		rs->printed++;
+
+	/* Note that the burst might be taken by a parallel call. */
+	if (atomic_read(&rs->rs_n_left) > 0 && atomic_dec_return(&rs->rs_n_left) >= 0)
 		ret = 1;
-	} else {
-		rs->missed++;
-		ret = 0;
-	}
+
+unlock_ret:
 	raw_spin_unlock(&rs->lock);
+
+nolock_ret:
+	if (!ret)
+		ratelimit_state_inc_miss(rs);
 
 	return ret;
 }

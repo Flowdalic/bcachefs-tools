@@ -32,4 +32,6 @@ int shrinker_register(struct shrinker *);
 
 void run_shrinkers(gfp_t gfp_mask, bool);
 
+void linux_shrinkers_init(void);
+
 #endif /* __TOOLS_LINUX_SHRINKER_H */

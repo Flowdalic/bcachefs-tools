@@ -31,8 +31,7 @@ static inline int bdi_congested(struct backing_dev_info *bdi, int cong_bits)
 	return 0;
 }
 
-static inline int __must_check bdi_setup_and_register(struct backing_dev_info *bdi,
-						      char *name)
+static inline int bdi_setup_and_register(struct backing_dev_info *bdi, char *name)
 {
 	bdi->capabilities = 0;
 	return 0;

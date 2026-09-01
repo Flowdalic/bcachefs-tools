@@ -1,5 +1,8 @@
 #include <pthread.h>
 
+#include "tools-util.h"
+
+#include <linux/errname.h>
 #include <linux/kthread.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -18,15 +21,6 @@ struct workqueue_struct {
 	char			name[24];
 };
 
-enum {
-	WORK_PENDING_BIT,
-};
-
-static bool work_pending(struct work_struct *work)
-{
-	return test_bit(WORK_PENDING_BIT, work_data_bits(work));
-}
-
 static void clear_work_pending(struct work_struct *work)
 {
 	clear_bit(WORK_PENDING_BIT, work_data_bits(work));
@@ -37,6 +31,46 @@ static bool set_work_pending(struct work_struct *work)
 	return !test_and_set_bit(WORK_PENDING_BIT, work_data_bits(work));
 }
 
+static int worker_thread(void *arg)
+{
+	struct workqueue_struct *wq = arg;
+	struct work_struct *work;
+
+	pthread_mutex_lock(&wq_lock);
+	while (1) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		work = list_first_entry_or_null(&wq->pending_work,
+				struct work_struct, entry);
+		wq->current_work = work;
+
+		if (kthread_should_stop()) {
+			BUG_ON(wq->current_work);
+			break;
+		}
+
+		if (!work) {
+			pthread_mutex_unlock(&wq_lock);
+			schedule();
+			pthread_mutex_lock(&wq_lock);
+			continue;
+		}
+		__set_current_state(TASK_RUNNING);
+
+		BUG_ON(!work_pending(work));
+		list_del_init(&work->entry);
+		clear_work_pending(work);
+
+		pthread_mutex_unlock(&wq_lock);
+		work->func(work);
+		pthread_mutex_lock(&wq_lock);
+
+		pthread_cond_broadcast(&work_finished);
+	}
+	pthread_mutex_unlock(&wq_lock);
+
+	return 0;
+}
+
 static void __queue_work(struct workqueue_struct *wq,
 			 struct work_struct *work)
 {
@@ -44,6 +78,13 @@ static void __queue_work(struct workqueue_struct *wq,
 	BUG_ON(!list_empty(&work->entry));
 
 	list_add_tail(&work->entry, &wq->pending_work);
+
+	if (!wq->worker) {
+		wq->worker = kthread_run(worker_thread, wq, "%s", wq->name);
+		int ret = PTR_ERR_OR_ZERO(wq->worker);
+		if (ret)
+			die("error creating workqueue thread: %s\n", errname(ret));
+	}
 	wake_up_process(wq->worker);
 }
 
@@ -230,48 +271,18 @@ bool cancel_delayed_work_sync(struct delayed_work *dwork)
 	return ret;
 }
 
-static int worker_thread(void *arg)
+void drain_workqueue(struct workqueue_struct *wq)
 {
-	struct workqueue_struct *wq = arg;
-	struct work_struct *work;
-
 	pthread_mutex_lock(&wq_lock);
-	while (1) {
-		__set_current_state(TASK_INTERRUPTIBLE);
-		work = list_first_entry_or_null(&wq->pending_work,
-				struct work_struct, entry);
-		wq->current_work = work;
-
-		if (kthread_should_stop()) {
-			BUG_ON(wq->current_work);
-			break;
-		}
-
-		if (!work) {
-			pthread_mutex_unlock(&wq_lock);
-			schedule();
-			pthread_mutex_lock(&wq_lock);
-			continue;
-		}
-
-		BUG_ON(!work_pending(work));
-		list_del_init(&work->entry);
-		clear_work_pending(work);
-
-		pthread_mutex_unlock(&wq_lock);
-		work->func(work);
-		pthread_mutex_lock(&wq_lock);
-
-		pthread_cond_broadcast(&work_finished);
-	}
+	while (!list_empty(&wq->pending_work) || wq->current_work)
+		pthread_cond_wait(&work_finished, &wq_lock);
 	pthread_mutex_unlock(&wq_lock);
-
-	return 0;
 }
 
 void destroy_workqueue(struct workqueue_struct *wq)
 {
-	kthread_stop(wq->worker);
+	if (wq->worker)
+		kthread_stop(wq->worker);
 
 	pthread_mutex_lock(&wq_lock);
 	list_del(&wq->list);
@@ -299,12 +310,6 @@ struct workqueue_struct *alloc_workqueue(const char *fmt,
 	vsnprintf(wq->name, sizeof(wq->name), fmt, args);
 	va_end(args);
 
-	wq->worker = kthread_run(worker_thread, wq, "%s", wq->name);
-	if (IS_ERR(wq->worker)) {
-		kfree(wq);
-		return NULL;
-	}
-
 	pthread_mutex_lock(&wq_lock);
 	list_add(&wq->list, &wq_list);
 	pthread_mutex_unlock(&wq_lock);
@@ -330,17 +335,4 @@ static void wq_init(void)
 					      WQ_FREEZABLE, 0);
 	BUG_ON(!system_wq || !system_highpri_wq || !system_long_wq ||
 	       !system_unbound_wq || !system_freezable_wq);
-}
-
-__attribute__((destructor(102)))
-static void wq_cleanup(void)
-{
-	destroy_workqueue(system_freezable_wq);
-	destroy_workqueue(system_unbound_wq);
-	destroy_workqueue(system_long_wq);
-	destroy_workqueue(system_highpri_wq);
-	destroy_workqueue(system_wq);
-
-	system_wq = system_highpri_wq = system_long_wq = system_unbound_wq =
-		system_freezable_wq = NULL;
 }

@@ -3,6 +3,7 @@
 
 #include <urcu.h>
 #include <linux/compiler.h>
+#include <linux/cleanup.h>
 
 #define ULONG_CMP_GE(a, b)      (ULONG_MAX / 2 >= (a) - (b))
 
@@ -45,5 +46,19 @@ rcu_head_after_call_rcu(struct rcu_head *rhp,
 		return true;
 	return false;
 }
+
+DEFINE_LOCK_GUARD_0(rcu,
+	do {
+		rcu_read_lock();
+		/*
+		 * sparse doesn't call the cleanup function,
+		 * so just release immediately and don't track
+		 * the context. We don't need to anyway, since
+		 * the whole point of the guard is to not need
+		 * the explicit unlock.
+		 */
+		__release(RCU);
+	} while (0),
+	rcu_read_unlock())
 
 #endif /* __TOOLS_LINUX_RCUPDATE_H */

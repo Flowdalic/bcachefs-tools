@@ -29,7 +29,7 @@ static inline int timer_pending(const struct timer_list *timer)
 }
 
 int del_timer(struct timer_list * timer);
-int del_timer_sync(struct timer_list *timer);
+int timer_delete_sync(struct timer_list *timer);
 
 #define del_singleshot_timer_sync(timer) del_timer_sync(timer)
 

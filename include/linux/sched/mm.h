@@ -1,6 +1,8 @@
 #ifndef _LINUX_SCHED_MM_H
 #define _LINUX_SCHED_MM_H
 
+#include <linux/mm.h>
+
 #define PF_MEMALLOC		0x00000800	/* Allocating memory */
 #define PF_MEMALLOC_NOFS	0x00040000	/* All allocation requests will inherit GFP_NOFS */
 

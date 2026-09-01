@@ -7,6 +7,7 @@
 #include <linux/completion.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/wait_bit.h>
 
 static inline int waitqueue_active(wait_queue_head_t *q)
 {
@@ -142,12 +143,6 @@ int autoremove_wake_function(wait_queue_t *wait, unsigned mode, int sync, void *
 	return ret;
 }
 
-struct wait_bit_key {
-	void			*flags;
-	int			bit_nr;
-	unsigned long		timeout;
-};
-
 struct wait_bit_queue {
 	struct wait_bit_key	key;
 	wait_queue_t		wait;
@@ -202,6 +197,25 @@ void __wait_on_bit(void *word, int bit, unsigned mode)
 	finish_wait(&bit_wq, &wait.wait);
 }
 
+int out_of_line_wait_on_bit_timeout(unsigned long *word, int bit,
+				    wait_bit_action_f *action,
+				    unsigned mode, unsigned long timeout)
+{
+	DEFINE_WAIT_BIT(wait, word, bit);
+	int ret = 0;
+
+	wait.key.timeout = jiffies + timeout;
+
+	do {
+		prepare_to_wait(&bit_wq, &wait.wait, mode);
+		if (test_bit(wait.key.bit_nr, wait.key.flags))
+			ret = action(&wait.key, mode);
+	} while (test_bit(wait.key.bit_nr, wait.key.flags) && !ret);
+
+	finish_wait(&bit_wq, &wait.wait);
+	return ret;
+}
+
 void __wait_on_bit_lock(void *word, int bit, unsigned mode)
 {
 	DEFINE_WAIT_BIT(wait, word, bit);
@@ -247,4 +261,29 @@ void wait_for_completion(struct completion *x)
 	x->done--;
 out:
 	spin_unlock_irq(&x->wait.lock);
+}
+
+unsigned long wait_for_completion_timeout(struct completion *x, unsigned long timeout)
+{
+	spin_lock_irq(&x->wait.lock);
+
+	if (!x->done) {
+		DECLARE_WAITQUEUE(wait, current);
+
+		__add_wait_queue_tail_exclusive(&x->wait, &wait);
+		do {
+			__set_current_state(TASK_UNINTERRUPTIBLE);
+			spin_unlock_irq(&x->wait.lock);
+
+			timeout = schedule_timeout(timeout);
+			spin_lock_irq(&x->wait.lock);
+		} while (!x->done);
+		__remove_wait_queue(&x->wait, &wait);
+		if (!x->done)
+			goto out;
+	}
+	x->done--;
+out:
+	spin_unlock_irq(&x->wait.lock);
+	return timeout;
 }

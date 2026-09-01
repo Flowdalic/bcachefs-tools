@@ -1,15 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -o errexit
+
+trap 'rc=$?; echo >&2 "make-release-tarball.sh: FAILED at line $LINENO: \`$BASH_COMMAND\` (exit $rc)"; exit $rc' ERR
 
 version=$1
 
 git checkout v$version
 git clean -xfd
+make generate_version
 
 cargo license > COPYING.rust-dependencies
 
 git ls-files|
+    { cat; echo "version.h"; }|
     tar --create --file bcachefs-tools-$version.tar -T -	\
 	--transform="s_^_bcachefs-tools-$version/_"
 
@@ -28,7 +32,7 @@ scp bcachefs-tools-$version.tar.zst	evilpiepirate.org:/var/www/htdocs/bcachefs-t
 scp bcachefs-tools-$version.tar.asc	evilpiepirate.org:/var/www/htdocs/bcachefs-tools/
 scp bcachefs-tools-$version.tar.sign	evilpiepirate.org:/var/www/htdocs/bcachefs-tools/
 
-cargo vendor
+cargo-vendor-filterer
 
 mkdir .cargo
 cat > .cargo/config.toml <<-ZZ

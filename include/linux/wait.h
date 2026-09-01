@@ -96,11 +96,14 @@ do {									\
 #define wait_event_freezable(wq, condition)	({wait_event(wq, condition); 0; })
 #define wait_event_killable(wq, condition)	({wait_event(wq, condition); 0; })
 #define wait_event_interruptible(wq, condition)	({wait_event(wq, condition); 0; })
+#define wait_event_state(wq, condition, state)	({wait_event(wq, condition); 0; })
 
 #define __wait_event_timeout(wq, condition, timeout)			\
 	___wait_event(wq, ___wait_cond_timeout(condition),		\
 		      TASK_UNINTERRUPTIBLE, 0, timeout,			\
 		      __ret = schedule_timeout(__ret))
+
+#define wait_event_freezable_timeout(wq, condition, timeout)	wait_event_timeout(wq, condition, timeout)
 
 #define wait_event_timeout(wq, condition, timeout)			\
 ({									\

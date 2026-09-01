@@ -1,10 +1,7 @@
-#include <assert.h>
-#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <linux/fs.h>
-#include <math.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,11 +14,13 @@
 #include <blkid.h>
 #include <uuid/uuid.h>
 
+#include "bcachefs_ioctl.h"
+#include "util/printbuf.h"
+#include "util/util.h"
+
 #include "libbcachefs.h"
-#include "libbcachefs/bcachefs_ioctl.h"
-#include "linux/sort.h"
 #include "tools-util.h"
-#include "libbcachefs/util.h"
+#include "src/rust_to_c.h"
 
 void die(const char *fmt, ...)
 {
@@ -35,50 +34,73 @@ void die(const char *fmt, ...)
 	_exit(EXIT_FAILURE);
 }
 
-char *mprintf(const char *fmt, ...)
+/*
+ * Fatal-signal handler: print signal name and a unified backtrace via
+ * bch2_prt_task_backtrace (libunwind + rustc-demangle + libdw line info),
+ * then re-raise. SA_RESETHAND means our handler ran once and the default
+ * disposition is restored, so re-raising terminates with the kernel's
+ * default action (core dump if ulimit -c permits).
+ *
+ * Strictly speaking bch2_prt_task_backtrace allocates (printbuf grow,
+ * darray_push), which isn't async-signal-safe. In practice the failure
+ * paths that bring us here (NULL deref, assert, illegal insn) aren't on
+ * malloc's call path, so this works reliably; if it ever does deadlock,
+ * the user can SIGKILL and inspect the core file.
+ */
+static void fatal_signal_handler(int signo)
 {
-	va_list args;
+	const char *name;
+	switch (signo) {
+	case SIGSEGV: name = "\nbcachefs: fatal SIGSEGV\n"; break;
+	case SIGILL:  name = "\nbcachefs: fatal SIGILL\n";  break;
+	case SIGBUS:  name = "\nbcachefs: fatal SIGBUS\n";  break;
+	case SIGFPE:  name = "\nbcachefs: fatal SIGFPE\n";  break;
+	case SIGABRT: name = "\nbcachefs: fatal SIGABRT\n"; break;
+	default:      name = "\nbcachefs: fatal signal\n";  break;
+	}
+	(void) !write(STDERR_FILENO, name, strlen(name));
+
+	struct printbuf buf = PRINTBUF;
+	bch2_prt_task_backtrace(&buf, current, 1, GFP_NOWAIT);
+	(void) !write(STDERR_FILENO, buf.buf, buf.pos);
+	printbuf_exit(&buf);
+
+	raise(signo);
+	_exit(128 + signo);
+}
+
+void bch2_install_fatal_signal_handlers(void)
+{
+	struct sigaction sa = {};
+	sa.sa_handler = fatal_signal_handler;
+	sa.sa_flags = SA_NODEFER | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+
+	static const int signals[] = {
+		SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGABRT,
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(signals); i++)
+		sigaction(signals[i], &sa, NULL);
+}
+
+char *vmprintf(const char *fmt, va_list args)
+{
 	char *str;
-	int ret;
-
-	va_start(args, fmt);
-	ret = vasprintf(&str, fmt, args);
-	va_end(args);
-
+	int ret = vasprintf(&str, fmt, args);
 	if (ret < 0)
 		die("insufficient memory");
 
 	return str;
 }
 
-void xpread(int fd, void *buf, size_t count, off_t offset)
+char *mprintf(const char *fmt, ...)
 {
-	while (count) {
-		ssize_t r = pread(fd, buf, count, offset);
+	va_list args;
+	va_start(args, fmt);
+	char *str = vmprintf(fmt, args);
+	va_end(args);
 
-		if (r < 0)
-			die("read error: %m");
-		if (!r)
-			die("pread error: unexpected eof");
-		count	-= r;
-		offset	+= r;
-	}
-}
-
-void xpwrite(int fd, const void *buf, size_t count, off_t offset, const char *msg)
-{
-	ssize_t r = pwrite(fd, buf, count, offset);
-
-	if (r != count)
-		die("error writing %s (ret %zi err %m)", msg, r);
-}
-
-struct stat xfstatat(int dirfd, const char *path, int flags)
-{
-	struct stat stat;
-	if (fstatat(dirfd, path, &stat, flags))
-		die("stat error: %m");
-	return stat;
+	return str;
 }
 
 struct stat xfstat(int fd)
@@ -89,26 +111,7 @@ struct stat xfstat(int fd)
 	return stat;
 }
 
-struct stat xstat(const char *path)
-{
-	struct stat statbuf;
-	if (stat(path, &statbuf))
-		die("stat error statting %s: %m", path);
-	return statbuf;
-}
-
 /* File parsing (i.e. sysfs) */
-
-void write_file_str(int dirfd, const char *path, const char *str)
-{
-	int fd = xopenat(dirfd, path, O_WRONLY);
-	ssize_t wrote, len = strlen(str);
-
-	wrote = write(fd, str, len);
-	if (wrote != len)
-		die("read error: %m");
-	close(fd);
-}
 
 char *read_file_str(int dirfd, const char *path)
 {
@@ -129,7 +132,7 @@ char *read_file_str(int dirfd, const char *path)
 		buf = NULL;
 	}
 
-	close(fd);
+	xclose(fd);
 
 	return buf;
 }
@@ -144,64 +147,37 @@ u64 read_file_u64(int dirfd, const char *path)
 	return v;
 }
 
-/* String list options: */
-
-ssize_t read_string_list_or_die(const char *opt, const char * const list[],
-				const char *msg)
+/* Check for existing filesystems using blkid and optionally wipe them: */
+void blkid_check(int fd, const char *path, bool force)
 {
-	ssize_t v = match_string(list, -1, opt);
-	if (v < 0)
-		die("Bad %s %s", msg, opt);
+	int blkid_version_code = blkid_get_library_version(NULL, NULL);
+	if (blkid_version_code < 2401) {
+		if (force) {
+			fprintf(
+				stderr,
+				"Continuing with out of date libblkid %s because --force was passed.\n",
+				BLKID_VERSION);
+		} else {
+			// Reference for picking 2.40.1:
+			// https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/v2.40.1-ReleaseNotes
+			// https://github.com/util-linux/util-linux/issues/3103
+			die(
+				"Refusing to format when using libblkid %s\n"
+				"libblkid >= 2.40.1 is required to check for existing filesystems\n"
+				"Earlier versions may not recognize some bcachefs filesystems.\n", BLKID_VERSION);
+		}
+	}
 
-	return v;
-}
-
-/* Returns size of file or block device: */
-u64 get_size(int fd)
-{
-	struct stat statbuf = xfstat(fd);
-
-	if (!S_ISBLK(statbuf.st_mode))
-		return statbuf.st_size;
-
-	u64 ret;
-	xioctl(fd, BLKGETSIZE64, &ret);
-	return ret;
-}
-
-/* Returns blocksize, in bytes: */
-unsigned get_blocksize(int fd)
-{
-	struct stat statbuf = xfstat(fd);
-
-	if (!S_ISBLK(statbuf.st_mode))
-		return statbuf.st_blksize;
-
-	unsigned ret;
-	xioctl(fd, BLKPBSZGET, &ret);
-	return ret;
-}
-
-/* Open a block device, do magic blkid stuff to probe for existing filesystems: */
-int open_for_format(struct dev_opts *dev, bool force)
-{
 	blkid_probe pr;
-	const char *fs_type = NULL, *fs_label = NULL;
-	size_t fs_type_len, fs_label_len;
-
-	dev->file = bdev_file_open_by_path(dev->path,
-				BLK_OPEN_READ|BLK_OPEN_WRITE|BLK_OPEN_EXCL|BLK_OPEN_BUFFERED,
-				dev, NULL);
-	int ret = PTR_ERR_OR_ZERO(dev->file);
-	if (ret < 0)
-		die("Error opening device to format %s: %s", dev->path, strerror(-ret));
-	dev->bdev = file_bdev(dev->file);
+	const char *fs_type = NULL, *fs_label = NULL, *pt_type = NULL;
+	size_t fs_type_len, fs_label_len, pt_type_len;
 
 	if (!(pr = blkid_new_probe()))
 		die("blkid error 1");
-	if (blkid_probe_set_device(pr, dev->bdev->bd_fd, 0, 0))
+	if (blkid_probe_set_device(pr, fd, 0, 0))
 		die("blkid error 2");
 	if (blkid_probe_enable_partitions(pr, true) ||
+	    blkid_probe_set_partitions_flags(pr, BLKID_PARTS_MAGIC) ||
 	    blkid_probe_enable_superblocks(pr, true) ||
 	    blkid_probe_set_superblocks_flags(pr,
 			BLKID_SUBLKS_LABEL|BLKID_SUBLKS_TYPE|BLKID_SUBLKS_MAGIC))
@@ -211,19 +187,31 @@ int open_for_format(struct dev_opts *dev, bool force)
 
 	blkid_probe_lookup_value(pr, "TYPE", &fs_type, &fs_type_len);
 	blkid_probe_lookup_value(pr, "LABEL", &fs_label, &fs_label_len);
+	blkid_probe_lookup_value(pr, "PTTYPE", &pt_type, &pt_type_len);
 
-	if (fs_type) {
-		if (fs_label)
-			printf("%s contains a %s filesystem labelled '%s'\n",
-			       dev->path, fs_type, fs_label);
-		else
-			printf("%s contains a %s filesystem\n",
-			       dev->path, fs_type);
+	if (fs_type || pt_type) {
+		if (fs_type) {
+			if (fs_label)
+				printf("%s contains a %s filesystem labelled '%s'\n",
+				       path, fs_type, fs_label);
+			else
+				printf("%s contains a %s filesystem\n",
+				       path, fs_type);
+		}
+		if (pt_type)
+			printf("%s contains a %s partition table\n", path, pt_type);
+
 		if (!force) {
-			fputs("Proceed anyway?", stdout);
+			fputs("Proceed anyway (existing signatures will be wiped)?", stdout);
 			if (!ask_yn())
 				exit(EXIT_FAILURE);
 		}
+		/*
+		 * Wipe fs superblock and partition-table signatures both (the
+		 * probe enables BLKID_SUBLKS_MAGIC and BLKID_PARTS_MAGIC), so
+		 * former-partition fs signatures can't linger to confuse
+		 * UUID-based device discovery after a whole-disk format.
+		 */
 		while (blkid_do_probe(pr) == 0) {
 			if (blkid_do_wipe(pr, 0))
 				die("Failed to wipe preexisting metadata.");
@@ -231,7 +219,6 @@ int open_for_format(struct dev_opts *dev, bool force)
 	}
 
 	blkid_free_probe(pr);
-	return ret;
 }
 
 bool ask_yn(void)
@@ -250,86 +237,6 @@ bool ask_yn(void)
 	ret = strchr(short_yes, buf[0]);
 	free(buf);
 	return ret;
-}
-
-static int range_cmp(const void *_l, const void *_r)
-{
-	const struct range *l = _l, *r = _r;
-
-	if (l->start < r->start)
-		return -1;
-	if (l->start > r->start)
-		return  1;
-	return 0;
-}
-
-void ranges_sort_merge(ranges *r)
-{
-	ranges tmp = { 0 };
-
-	sort(r->data, r->nr, sizeof(r->data[0]), range_cmp, NULL);
-
-	/* Merge contiguous ranges: */
-	darray_for_each(*r, i) {
-		struct range *t = tmp.nr ? &tmp.data[tmp.nr - 1] : NULL;
-
-		if (t && t->end >= i->start)
-			t->end = max(t->end, i->end);
-		else
-			darray_push(&tmp, *i);
-	}
-
-	darray_exit(r);
-	*r = tmp;
-}
-
-void ranges_roundup(ranges *r, unsigned block_size)
-{
-	darray_for_each(*r, i) {
-		i->start = round_down(i->start, block_size);
-		i->end	= round_up(i->end, block_size);
-	}
-}
-
-void ranges_rounddown(ranges *r, unsigned block_size)
-{
-	darray_for_each(*r, i) {
-		i->start = round_up(i->start, block_size);
-		i->end	= round_down(i->end, block_size);
-		i->end	= max(i->end, i->start);
-	}
-}
-
-struct fiemap_extent fiemap_iter_next(struct fiemap_iter *iter)
-{
-	struct fiemap_extent e;
-
-	BUG_ON(iter->idx > iter->f->fm_mapped_extents);
-
-	if (iter->idx == iter->f->fm_mapped_extents) {
-		xioctl(iter->fd, FS_IOC_FIEMAP, iter->f);
-
-		if (!iter->f->fm_mapped_extents)
-			return (struct fiemap_extent) { .fe_length = 0 };
-
-		iter->idx = 0;
-	}
-
-	e = iter->f->fm_extents[iter->idx++];
-	BUG_ON(!e.fe_length);
-
-	iter->f->fm_start = e.fe_logical + e.fe_length;
-
-	return e;
-}
-
-char *strcmp_prefix(char *a, const char *a_prefix)
-{
-	while (*a_prefix && *a == *a_prefix) {
-		a++;
-		a_prefix++;
-	}
-	return *a_prefix ? NULL : a;
 }
 
 /* crc32c */
@@ -488,236 +395,3 @@ u32 crc32c(u32 crc, const void *buf, size_t size)
 }
 
 #endif /* HAVE_WORKING_IFUNC */
-
-char *dev_to_name(dev_t dev)
-{
-	char *line = NULL, *name = NULL;
-	size_t n = 0;
-
-	FILE *f = fopen("/proc/partitions", "r");
-	if (!f)
-		die("error opening /proc/partitions: %m");
-
-	while (getline(&line, &n, f) != -1) {
-		unsigned ma, mi;
-		u64 sectors;
-
-		name = realloc(name, n + 1);
-
-		if (sscanf(line, " %u %u %llu %s", &ma, &mi, &sectors, name) == 4 &&
-		    ma == major(dev) && mi == minor(dev))
-			goto found;
-	}
-
-	free(name);
-	name = NULL;
-found:
-	fclose(f);
-	free(line);
-	return name;
-}
-
-char *dev_to_path(dev_t dev)
-{
-	char *name = dev_to_name(dev);
-	if (!name)
-		return NULL;
-
-	char *path = mprintf("/dev/%s", name);
-
-	free(name);
-	return path;
-}
-
-struct mntent *dev_to_mount(char *dev)
-{
-	struct mntent *mnt, *ret = NULL;
-	FILE *f = setmntent("/proc/mounts", "r");
-	if (!f)
-		die("error opening /proc/mounts: %m");
-
-	struct stat d1 = xstat(dev);
-
-	while ((mnt = getmntent(f))) {
-		char *d, *p = mnt->mnt_fsname;
-
-		while ((d = strsep(&p, ":"))) {
-			struct stat d2;
-
-			if (stat(d, &d2))
-				continue;
-
-			if (S_ISBLK(d1.st_mode) != S_ISBLK(d2.st_mode))
-				continue;
-
-			if (S_ISBLK(d1.st_mode)) {
-				if (d1.st_rdev != d2.st_rdev)
-					continue;
-			} else {
-				if (d1.st_dev != d2.st_dev ||
-				    d1.st_ino != d2.st_ino)
-					continue;
-			}
-
-			ret = mnt;
-			goto found;
-		}
-	}
-found:
-	fclose(f);
-	return ret;
-}
-
-int dev_mounted(char *dev)
-{
-	struct mntent *mnt = dev_to_mount(dev);
-
-	if (!mnt)
-		return 0;
-	if (hasmntopt(mnt, "ro"))
-		return 1;
-	return 2;
-}
-
-static char *dev_to_sysfs_path(dev_t dev)
-{
-	return mprintf("/sys/dev/block/%u:%u", major(dev), minor(dev));
-}
-
-char *fd_to_dev_model(int fd)
-{
-	struct stat stat = xfstat(fd);
-
-	if (S_ISBLK(stat.st_mode)) {
-		char *sysfs_path = dev_to_sysfs_path(stat.st_rdev);
-
-		char *model_path = mprintf("%s/device/model", sysfs_path);
-		if (!access(model_path, R_OK))
-			goto got_model;
-		free(model_path);
-
-		/* partition? try parent */
-
-		char buf[1024];
-		if (readlink(sysfs_path, buf, sizeof(buf)) < 0)
-			die("readlink error on %s: %m", sysfs_path);
-
-		free(sysfs_path);
-		sysfs_path = strdup(buf);
-
-		*strrchr(sysfs_path, '/') = 0;
-		model_path = mprintf("%s/device/model", sysfs_path);
-		if (!access(model_path, R_OK))
-			goto got_model;
-
-		return strdup("(unknown device)");
-		char *model;
-got_model:
-		model = read_file_str(AT_FDCWD, model_path);
-		free(model_path);
-		free(sysfs_path);
-		return model;
-	} else {
-		return strdup("(reg file)");
-	}
-}
-
-static int kstrtoull_symbolic(const char *s, unsigned int base, unsigned long long *res)
-{
-	if (!strcmp(s, "U64_MAX")) {
-		*res = U64_MAX;
-		return 0;
-	}
-
-	if (!strcmp(s, "U32_MAX")) {
-		*res = U32_MAX;
-		return 0;
-	}
-
-	return kstrtoull(s, base, res);
-}
-
-static int kstrtouint_symbolic(const char *s, unsigned int base, unsigned *res)
-{
-	unsigned long long tmp;
-	int rv;
-
-	rv = kstrtoull_symbolic(s, base, &tmp);
-	if (rv < 0)
-		return rv;
-	if (tmp != (unsigned long long)(unsigned int)tmp)
-		return -ERANGE;
-	*res = tmp;
-	return 0;
-}
-
-struct bpos bpos_parse(char *buf)
-{
-	char *orig = strdup(buf);
-	char *s = buf;
-
-	char *inode_s	= strsep(&s, ":");
-	char *offset_s	= strsep(&s, ":");
-	char *snapshot_s = strsep(&s, ":");
-
-	if (!inode_s || !offset_s || s)
-		die("invalid bpos %s", orig);
-	free(orig);
-
-	u64 inode_v = 0, offset_v = 0;
-	u32 snapshot_v = 0;
-	if (kstrtoull_symbolic(inode_s, 10, &inode_v))
-		die("invalid bpos.inode %s", inode_s);
-
-	if (kstrtoull_symbolic(offset_s, 10, &offset_v))
-		die("invalid bpos.offset %s", offset_s);
-
-	if (snapshot_s &&
-	    kstrtouint_symbolic(snapshot_s, 10, &snapshot_v))
-		die("invalid bpos.snapshot %s", snapshot_s);
-
-	return (struct bpos) { .inode = inode_v, .offset = offset_v, .snapshot = snapshot_v };
-}
-
-struct bbpos bbpos_parse(char *buf)
-{
-	char *s = buf, *field;
-	struct bbpos ret;
-
-	if (!(field = strsep(&s, ":")))
-		die("invalid bbpos %s", buf);
-
-	ret.btree = read_string_list_or_die(field, __bch2_btree_ids, "btree id");
-
-	if (!s)
-		die("invalid bbpos %s", buf);
-
-	ret.pos = bpos_parse(s);
-	return ret;
-}
-
-struct bbpos_range bbpos_range_parse(char *buf)
-{
-	char *s = buf;
-	char *start_str = strsep(&s, "-");
-	char *end_str	= strsep(&s, "-");
-
-	struct bbpos start = bbpos_parse(start_str);
-	struct bbpos end = end_str ? bbpos_parse(end_str) : start;
-
-	return (struct bbpos_range) { .start = start, .end = end };
-}
-
-darray_str get_or_split_cmdline_devs(int argc, char *argv[])
-{
-	darray_str ret = {};
-
-	if (argc == 1) {
-		bch2_split_devs(argv[0], &ret);
-	} else {
-		for (unsigned i = 0; i < argc; i++)
-			darray_push(&ret, strdup(argv[i]));
-	}
-
-	return ret;
-}

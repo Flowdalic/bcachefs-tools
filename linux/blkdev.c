@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -29,17 +30,75 @@ struct fops {
 	void (*write)(struct bio *bio, struct iovec * iov, unsigned i);
 };
 
-static struct fops *fops;
+static void sync_check(struct bio *bio, int ret)
+{
+	if (ret != bio->bi_iter.bi_size) {
+		fprintf(stderr, "IO error: %s\n", ret < 0 ? strerror(errno) : "short IO");
+		bio->bi_status = BLK_STS_IOERR;
+	}
+
+	if (bio->bi_opf & REQ_FUA) {
+		ret = fdatasync(bio->bi_bdev->bd_fd);
+		if (ret) {
+			fprintf(stderr, "fsync error: %s\n", strerror(errno));
+			bio->bi_status = BLK_STS_IOERR;
+		}
+	}
+	bio_endio(bio);
+}
+
+static void sync_init(void) {}
+static void sync_cleanup(void) {}
+
+static void sync_read(struct bio *bio, struct iovec * iov, unsigned i)
+{
+
+	ssize_t ret = preadv(bio->bi_bdev->bd_fd, iov, i,
+			     bio->bi_iter.bi_sector << 9);
+	sync_check(bio, ret);
+}
+
+static void sync_write(struct bio *bio, struct iovec * iov, unsigned i)
+{
+	ssize_t ret = pwritev2(bio->bi_bdev->bd_fd, iov, i,
+			       bio->bi_iter.bi_sector << 9,
+			       bio->bi_opf & REQ_FUA ? RWF_SYNC : 0);
+	sync_check(bio, ret);
+}
+
+static void aio_init(void);
+static void aio_cleanup(void);
+static void aio_read(struct bio *bio, struct iovec *iov, unsigned i);
+static void aio_write(struct bio *bio, struct iovec * iov, unsigned i);
+
+struct fops fops_list[] = {
+	{
+		.init		= aio_init,
+		.cleanup	= aio_cleanup,
+		.read		= aio_read,
+		.write		= aio_write,
+	}, {
+		.init		= sync_init,
+		.cleanup	= sync_cleanup,
+		.read		= sync_read,
+		.write		= sync_write,
+	}, {
+		/* NULL */
+	}
+};
+
+/* Use sync before we init threads */
+static struct fops *fops = &fops_list[1];
 static io_context_t aio_ctx;
 static atomic_t running_requests;
 
 void generic_make_request(struct bio *bio)
 {
-	struct iovec *iov;
+	struct iovec *iov = NULL;
 	struct bvec_iter iter;
 	struct bio_vec bv;
 	ssize_t ret;
-	unsigned i;
+	unsigned i = 0;
 
 	if (bio->bi_opf & REQ_PREFLUSH) {
 		ret = fdatasync(bio->bi_bdev->bd_fd);
@@ -51,27 +110,27 @@ void generic_make_request(struct bio *bio)
 		}
 	}
 
-	i = 0;
-	bio_for_each_segment(bv, bio, iter)
-		i++;
+	if (bio_op(bio) == REQ_OP_READ ||
+	    bio_op(bio) == REQ_OP_WRITE) {
+		i = 0;
+		bio_for_each_segment(bv, bio, iter)
+			i++;
 
-	iov = alloca(sizeof(*iov) * i);
+		iov = alloca(sizeof(*iov) * i);
 
-	i = 0;
-	bio_for_each_segment(bv, bio, iter) {
-		void *start = page_address(bv.bv_page) + bv.bv_offset;
-		size_t len = bv.bv_len;
-
-		iov[i++] = (struct iovec) {
-			.iov_base = start,
-			.iov_len = len,
-		};
+		i = 0;
+		bio_for_each_segment(bv, bio, iter) {
+			iov[i++] = (struct iovec) {
+				.iov_base = bv.bv_addr,
+				.iov_len = bv.bv_len,
+			};
 
 #ifdef CONFIG_VALGRIND
-		/* To be pedantic it should only be on IO completion. */
-		if (bio_op(bio) == REQ_OP_READ)
-			VALGRIND_MAKE_MEM_DEFINED(start, len);
+			/* To be pedantic it should only be on IO completion. */
+			if (bio_op(bio) == REQ_OP_READ)
+				VALGRIND_MAKE_MEM_DEFINED(bv.bv_addr, bv.bv_len);
 #endif
+		}
 	}
 
 	switch (bio_op(bio)) {
@@ -85,6 +144,11 @@ void generic_make_request(struct bio *bio)
 		ret = fsync(bio->bi_bdev->bd_fd);
 		if (ret)
 			die("fsync error: %m");
+		bio_endio(bio);
+		break;
+	case REQ_OP_DISCARD:
+		fallocate(bio->bi_bdev->bd_fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,
+			  bio->bi_iter.bi_sector << 9, bio->bi_iter.bi_size);
 		bio_endio(bio);
 		break;
 	default:
@@ -128,18 +192,30 @@ int blkdev_issue_zeroout(struct block_device *bdev,
 
 unsigned bdev_logical_block_size(struct block_device *bdev)
 {
-	struct stat statbuf;
-	unsigned blksize;
-	int ret;
-
-	ret = fstat(bdev->bd_fd, &statbuf);
-	BUG_ON(ret);
+	struct stat statbuf = xfstat(bdev->bd_fd);
 
 	if (!S_ISBLK(statbuf.st_mode))
 		return statbuf.st_blksize;
 
-	xioctl(bdev->bd_fd, BLKPBSZGET, &blksize);
+	unsigned blksize;
+	xioctl(bdev->bd_fd, BLKSSZGET, &blksize);
 	return blksize;
+}
+
+bool bdev_nonrot(struct block_device *bdev)
+{
+	struct stat statbuf = xfstat(bdev->bd_fd);
+	if (!S_ISBLK(statbuf.st_mode))
+		return false;
+
+	char *path = mprintf("/sys/dev/block/%u:%u/queue/rotational",
+			     major(statbuf.st_rdev),
+			     minor(statbuf.st_rdev));
+	u64 v = !access(path, R_OK)
+		? read_file_u64(AT_FDCWD, path)
+		: 0;
+	free(path);
+	return !v;
 }
 
 sector_t get_capacity(struct gendisk *disk)
@@ -190,14 +266,21 @@ struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
 	if (mode & BLK_OPEN_EXCL)
 		flags |= O_EXCL;
 
-	fd = open(path, flags);
+	if (mode & BLK_OPEN_CREAT)
+		flags |= O_CREAT;
+
+	fd = open(path, flags, 0600);
 	if (fd < 0)
 		return ERR_PTR(-errno);
 
 	struct block_device *bdev = malloc(sizeof(*bdev));
 	memset(bdev, 0, sizeof(*bdev));
 
-	strncpy(bdev->name, path, sizeof(bdev->name));
+	/* strip directory */
+
+	char *fname = strrchr(path, '/');
+
+	strncpy(bdev->name, fname ? fname + 1 : path, sizeof(bdev->name));
 	bdev->name[sizeof(bdev->name) - 1] = '\0';
 
 	bdev->bd_dev		= xfstat(fd).st_rdev;
@@ -207,6 +290,8 @@ struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
 	bdev->bd_disk->bdi	= &bdev->bd_disk->__bdi;
 	bdev->queue.backing_dev_info = bdev->bd_disk->bdi;
 	bdev->bd_inode		= &bdev->__bd_inode;
+
+	mutex_init(&bdev->bd_holder_lock);
 
 	struct file *file = calloc(sizeof(*file), 1);
 	file->f_inode = bdev->bd_inode;
@@ -225,44 +310,6 @@ static void io_fallback(void)
 	if (fops->init == NULL)
 		die("no fallback possible, something is very wrong");
 	fops->init();
-}
-
-static void sync_check(struct bio *bio, int ret)
-{
-	if (ret != bio->bi_iter.bi_size) {
-		die("IO error: %s\n", strerror(-ret));
-	}
-
-	if (bio->bi_opf & REQ_FUA) {
-		ret = fdatasync(bio->bi_bdev->bd_fd);
-		if (ret)
-			die("fsync error: %s\n", strerror(-ret));
-	}
-	bio_endio(bio);
-}
-
-static void sync_init(void) {}
-
-static void sync_cleanup(void)
-{
-	/* not necessary? */
-	sync();
-}
-
-static void sync_read(struct bio *bio, struct iovec * iov, unsigned i)
-{
-
-	ssize_t ret = preadv(bio->bi_bdev->bd_fd, iov, i,
-			     bio->bi_iter.bi_sector << 9);
-	sync_check(bio, ret);
-}
-
-static void sync_write(struct bio *bio, struct iovec * iov, unsigned i)
-{
-	ssize_t ret = pwritev2(bio->bi_bdev->bd_fd, iov, i,
-			       bio->bi_iter.bi_sector << 9,
-			       bio->bi_opf & REQ_FUA ? RWF_SYNC : 0);
-	sync_check(bio, ret);
 }
 
 static DECLARE_WAIT_QUEUE_HEAD(aio_events_completed);
@@ -294,8 +341,12 @@ static int aio_completion_thread(void *arg)
 				continue;
 			}
 
-			if (ev->res != bio->bi_iter.bi_size)
-				bio->bi_status = BLK_STS_IOERR;
+			if (ev->res != bio->bi_iter.bi_size) {
+				if (ev->res == -ENOSPC)
+					bio->bi_status = BLK_STS_NOSPC;
+				else
+					bio->bi_status = BLK_STS_IOERR;
+			}
 
 			bio_endio(bio);
 			atomic_dec(&running_requests);
@@ -354,8 +405,8 @@ static void aio_cleanup(void)
 
 	put_task_struct(p);
 
-	close(fds[0]);
-	close(fds[1]);
+	xclose(fds[0]);
+	xclose(fds[1]);
 }
 
 static void aio_op(struct bio *bio, struct iovec *iov, unsigned i, int opcode)
@@ -391,39 +442,8 @@ static void aio_write(struct bio *bio, struct iovec * iov, unsigned i)
 	aio_op(bio, iov, i, IO_CMD_PWRITEV);
 }
 
-
-/* not implemented */
-static void uring_init(void) {
-	io_fallback();
-}
-
-struct fops fops_list[] = {
-	{
-		.init		= uring_init,
-	}, {
-		.init		= aio_init,
-		.cleanup	= aio_cleanup,
-		.read		= aio_read,
-		.write		= aio_write,
-	}, {
-		.init		= sync_init,
-		.cleanup	= sync_cleanup,
-		.read		= sync_read,
-		.write		= sync_write,
-	}, {
-		/* NULL */
-	}
-};
-
-__attribute__((constructor(102)))
-static void blkdev_init(void)
+void blkdev_init(void)
 {
 	fops = fops_list;
 	fops->init();
-}
-
-__attribute__((destructor(102)))
-static void blkdev_cleanup(void)
-{
-	fops->cleanup();
 }

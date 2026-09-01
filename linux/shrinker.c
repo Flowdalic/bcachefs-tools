@@ -2,11 +2,19 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <linux/blkdev.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/percpu.h>
 #include <linux/shrinker.h>
+
+#include <linux/futex.h>
+/* hack for mips: */
+#define CONFIG_RCU_HAVE_FUTEX 1
+#include <urcu/futex.h>
+#include <urcu.h>
 
 #include "tools-util.h"
 
@@ -15,6 +23,9 @@ static DEFINE_MUTEX(shrinker_lock);
 
 void shrinker_free(struct shrinker *s)
 {
+	if (!s)
+		return;
+
 	if (s->list.next) {
 		mutex_lock(&shrinker_lock);
 		list_del(&s->list);
@@ -116,10 +127,20 @@ static int shrinker_thread(void *arg)
 }
 
 struct task_struct *shrinker_task;
+unsigned long _totalram_pages;
 
-__attribute__((constructor(103)))
-static void shrinker_thread_init(void)
+void linux_shrinkers_init(void)
 {
+	rcu_init();
+	rcu_register_thread();
+	bch_percpu_thread_init();
+
+	blkdev_init();
+
+	struct sysinfo info;
+	si_meminfo(&info);
+	_totalram_pages = info.totalram >> PAGE_SHIFT;
+
 	shrinker_task = kthread_run(shrinker_thread, NULL, "shrinkers");
 	BUG_ON(IS_ERR(shrinker_task));
 }

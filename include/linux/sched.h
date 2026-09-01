@@ -79,6 +79,8 @@ struct task_struct {
 	int			(*thread_fn)(void *);
 	void			*thread_data;
 
+	int			prio;
+
 	atomic_t		usage;
 	int			state;
 
@@ -97,7 +99,14 @@ struct task_struct {
 	struct signal_struct	{
 		struct rw_semaphore exec_update_lock;
 	}			*signal, _signal;
+
+	struct {
+		u64		sum_exec_runtime;
+		u64		exec_start;
+	}			se;
 };
+
+#define MAX_RT_PRIO	0
 
 extern __thread struct task_struct *current;
 
@@ -181,11 +190,8 @@ static inline void ktime_get_coarse_real_ts64(struct timespec64 *ts)
 
 #define sched_annotate_sleep()	do {} while (0)
 
-static inline unsigned int stack_trace_save_tsk(struct task_struct *task,
+unsigned int stack_trace_save_tsk(struct task_struct *task,
 				  unsigned long *store, unsigned int size,
-				  unsigned int skipnr)
-{
-	return 0;
-}
+				  unsigned int skipnr);
 
 #endif /* __TOOLS_LINUX_SCHED_H */
