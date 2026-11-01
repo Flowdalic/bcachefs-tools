@@ -22,25 +22,13 @@
 
 struct file_operations;
 
-#include <linux/err.h>
+struct dentry *debugfs_create_file(const char *, umode_t,
+				   struct dentry *, void *,
+				   const struct file_operations *);
 
-static inline struct dentry *debugfs_create_file(const char *name, umode_t mode,
-					struct dentry *parent, void *data,
-					const struct file_operations *fops)
-{
-	return ERR_PTR(-ENODEV);
-}
+struct dentry *debugfs_create_dir(const char *, struct dentry *);
 
-static inline struct dentry *debugfs_create_dir(const char *name,
-						struct dentry *parent)
-{
-	return ERR_PTR(-ENODEV);
-}
-
-static inline void debugfs_remove(struct dentry *dentry)
-{ }
-
-static inline void debugfs_remove_recursive(struct dentry *dentry)
-{ }
+void debugfs_remove(struct dentry *);
+void debugfs_remove_recursive(struct dentry *);
 
 #endif

@@ -6,6 +6,12 @@
 #define barrier() __asm__ __volatile__("": : :"memory")
 #define barrier_data(ptr) __asm__ __volatile__("": :"r"(ptr) :"memory")
 
+#ifndef OPTIMIZER_HIDE_VAR
+/* Make the optimizer believe the variable can be manipulated arbitrarily. */
+#define OPTIMIZER_HIDE_VAR(var)						\
+	__asm__ ("" : "=r" (var) : "0" (var))
+#endif
+
 #ifndef __always_inline
 # define __always_inline	inline __attribute__((always_inline))
 #endif
@@ -25,7 +31,7 @@
 #define __always_inline	inline
 #endif
 
-#define noinline
+#define noinline		__attribute__((__noinline__))
 #define noinline_for_stack noinline
 
 #define __user
@@ -67,6 +73,7 @@
 #define __same_type(a, b)	__builtin_types_compatible_p(typeof(a), typeof(b))
 #define fallthrough		__attribute__((__fallthrough__))
 #define __noreturn		__attribute__((__noreturn__))
+#define __no_kmsan_checks
 
 #ifndef __counted_by
 #define __counted_by(nr)
@@ -186,5 +193,11 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 	(sizeof(int) == sizeof(*(8 ? ((void *)((long)(x) * 0l)) : (int *)8)))
 #define is_signed_type(type) (((type)(-1)) < (__force type)1)
 #define is_unsigned_type(type) (!is_signed_type(type))
+
+#define TYPEOF_UNQUAL(exp) __typeof__(exp)
+
+#define typeof_member(T, m)	typeof(((T*)0)->m)
+
+#define __cleanup(func) __maybe_unused __attribute__((__cleanup__(func)))
 
 #endif /* _TOOLS_LINUX_COMPILER_H */

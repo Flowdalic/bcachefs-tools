@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "bcachefs-package-ci"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bcachefs-package-ci"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+log = { version = "0.4", features = ["std"] }
+env_logger = { version = "0.10", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"
+signal-hook = "0.3"
+# Shared CI status-page renderer (also used by the module server). Replaces the
+# old scripts/generate-status-html.sh — single source for the dashboard.
+ci-dashboard = { git = "https://evilpiepirate.org/git/ci-dashboard.git" }

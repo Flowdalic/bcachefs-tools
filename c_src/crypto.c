@@ -15,8 +15,9 @@
 #include <sodium/crypto_pwhash_scryptsalsa208sha256.h>
 #include <uuid/uuid.h>
 
-#include "libbcachefs/checksum.h"
 #include "crypto.h"
+
+#include "data/checksum.h"
 
 char *read_passphrase(const char *prompt)
 {
@@ -54,27 +55,6 @@ char *read_passphrase(const char *prompt)
 	return buf;
 }
 
-char *read_passphrase_twice(const char *prompt)
-{
-	char *pass = read_passphrase(prompt);
-
-	if (!isatty(STDIN_FILENO))
-		return pass;
-
-	char *pass2 = read_passphrase("Enter same passphrase again: ");
-
-	if (strcmp(pass, pass2)) {
-		memzero_explicit(pass, strlen(pass));
-		memzero_explicit(pass2, strlen(pass2));
-		die("Passphrases do not match");
-	}
-
-	memzero_explicit(pass2, strlen(pass2));
-	free(pass2);
-
-	return pass;
-}
-
 struct bch_key derive_passphrase(struct bch_sb_field_crypt *crypt,
 				 const char *passphrase)
 {
@@ -109,7 +89,7 @@ bool bch2_sb_is_encrypted(struct bch_sb *sb)
 		bch2_key_is_encrypted(&crypt->key);
 }
 
-void bch2_passphrase_check(struct bch_sb *sb, const char *passphrase,
+bool bch2_passphrase_check(struct bch_sb *sb, const char *passphrase,
 			   struct bch_key *passphrase_key,
 			   struct bch_encrypted_key *sb_key)
 {
@@ -124,16 +104,15 @@ void bch2_passphrase_check(struct bch_sb *sb, const char *passphrase,
 
 	*passphrase_key = derive_passphrase(crypt, passphrase);
 
-	/* Check if the user supplied the correct passphrase: */
-	if (bch2_chacha_encrypt_key(passphrase_key, __bch2_sb_key_nonce(sb),
-				    sb_key, sizeof(*sb_key)))
-		die("error encrypting key");
+	bch2_chacha20(passphrase_key, __bch2_sb_key_nonce(sb), sb_key, sizeof(*sb_key));
 
 	if (bch2_key_is_encrypted(sb_key))
-		die("incorrect passphrase");
+		return true;
+
+	return false;
 }
 
-void bch2_add_key(struct bch_sb *sb,
+bool bch2_add_key(struct bch_sb *sb,
 		  const char *type,
 		  const char *keyring_str,
 		  const char *passphrase)
@@ -151,9 +130,10 @@ void bch2_add_key(struct bch_sb *sb,
 	else
 		die("unknown keyring %s", keyring_str);
 
-	bch2_passphrase_check(sb, passphrase,
+	if (bch2_passphrase_check(sb, passphrase,
 			      &passphrase_key,
-			      &sb_key);
+			      &sb_key))
+					return true;
 
 	char uuid[40];
 	uuid_unparse_lower(sb->user_uuid.b, uuid);
@@ -170,32 +150,53 @@ void bch2_add_key(struct bch_sb *sb,
 	free(description);
 	memzero_explicit(&passphrase_key, sizeof(passphrase_key));
 	memzero_explicit(&sb_key, sizeof(sb_key));
+
+	return false;
 }
 
 void bch_sb_crypt_init(struct bch_sb *sb,
 		       struct bch_sb_field_crypt *crypt,
 		       const char *passphrase)
 {
+	struct bch_key key;
+	get_random_bytes(&key, sizeof(key));
+
 	crypt->key.magic = BCH_KEY_MAGIC;
-	get_random_bytes(&crypt->key.key, sizeof(crypt->key.key));
+	crypt->key.key = key;
 
-	if (passphrase) {
+	bch_crypt_update_passphrase(sb, crypt, &key, passphrase);
+}
 
+void bch_crypt_update_passphrase(
+			struct bch_sb *sb,
+			struct bch_sb_field_crypt *crypt,
+			struct bch_key *key,
+			const char *new_passphrase)
+{
+
+	struct bch_encrypted_key new_key;
+	new_key.magic = BCH_KEY_MAGIC;
+	new_key.key = *key;
+
+	if(!new_passphrase) {
+		crypt->key = new_key;
+		return;
+	}
+
+	// If crypt already has an encrypted key reuse it's encryption params
+	if (!bch2_key_is_encrypted(&crypt->key)) {
 		SET_BCH_CRYPT_KDF_TYPE(crypt, BCH_KDF_SCRYPT);
 		SET_BCH_KDF_SCRYPT_N(crypt, ilog2(16384));
 		SET_BCH_KDF_SCRYPT_R(crypt, ilog2(8));
 		SET_BCH_KDF_SCRYPT_P(crypt, ilog2(16));
-
-		struct bch_key passphrase_key = derive_passphrase(crypt, passphrase);
-
-		assert(!bch2_key_is_encrypted(&crypt->key));
-
-		if (bch2_chacha_encrypt_key(&passphrase_key, __bch2_sb_key_nonce(sb),
-					   &crypt->key, sizeof(crypt->key)))
-			die("error encrypting key");
-
-		assert(bch2_key_is_encrypted(&crypt->key));
-
-		memzero_explicit(&passphrase_key, sizeof(passphrase_key));
 	}
+
+	struct bch_key passphrase_key = derive_passphrase(crypt, new_passphrase);
+
+	bch2_chacha20(&passphrase_key, __bch2_sb_key_nonce(sb), &new_key, sizeof(new_key));
+
+	memzero_explicit(&passphrase_key, sizeof(passphrase_key));
+
+	crypt->key = new_key;
+	assert(bch2_key_is_encrypted(&crypt->key));
 }

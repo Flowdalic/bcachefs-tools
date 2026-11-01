@@ -30,14 +30,25 @@ static const struct {
 	[BLK_STS_NOSPC]		= { -ENOSPC,	"critical space allocation" },
 	[BLK_STS_TRANSPORT]	= { -ENOLINK,	"recoverable transport" },
 	[BLK_STS_TARGET]	= { -EREMOTEIO,	"critical target" },
-	[BLK_STS_NEXUS]		= { -EBADE,	"critical nexus" },
+	[BLK_STS_RESV_CONFLICT]	= { -EBADE,	"reservation conflict" },
 	[BLK_STS_MEDIUM]	= { -ENODATA,	"critical medium" },
 	[BLK_STS_PROTECTION]	= { -EILSEQ,	"protection" },
 	[BLK_STS_RESOURCE]	= { -ENOMEM,	"kernel resource" },
+	[BLK_STS_DEV_RESOURCE]	= { -EBUSY,	"device resource" },
 	[BLK_STS_AGAIN]		= { -EAGAIN,	"nonblocking retry" },
+	[BLK_STS_OFFLINE]	= { -ENODEV,	"device offline" },
 
 	/* device mapper special case, should not leak out: */
 	[BLK_STS_DM_REQUEUE]	= { -EREMCHG, "dm internal retry" },
+
+	/* zone device specific errors */
+	[BLK_STS_ZONE_OPEN_RESOURCE]	= { -ETOOMANYREFS, "open zones exceeded" },
+	[BLK_STS_ZONE_ACTIVE_RESOURCE]	= { -EOVERFLOW, "active zones exceeded" },
+
+	/* Command duration limit device-side timeout */
+	[BLK_STS_DURATION_LIMIT]	= { -ETIME, "duration limit exceeded" },
+
+	[BLK_STS_INVAL]		= { -EINVAL,	"invalid" },
 
 	/* everything else not covered above: */
 	[BLK_STS_IOERR]		= { -EIO,	"I/O" },
@@ -64,27 +75,13 @@ const char *blk_status_to_str(blk_status_t status)
 void bio_copy_data_iter(struct bio *dst, struct bvec_iter *dst_iter,
 			struct bio *src, struct bvec_iter *src_iter)
 {
-	struct bio_vec src_bv, dst_bv;
-	void *src_p, *dst_p;
-	unsigned bytes;
-
 	while (src_iter->bi_size && dst_iter->bi_size) {
-		src_bv = bio_iter_iovec(src, *src_iter);
-		dst_bv = bio_iter_iovec(dst, *dst_iter);
+		struct bio_vec src_bv = bio_iter_iovec(src, *src_iter);
+		struct bio_vec dst_bv = bio_iter_iovec(dst, *dst_iter);
 
-		bytes = min(src_bv.bv_len, dst_bv.bv_len);
+		unsigned bytes = min(src_bv.bv_len, dst_bv.bv_len);
 
-		src_p = kmap_atomic(src_bv.bv_page);
-		dst_p = kmap_atomic(dst_bv.bv_page);
-
-		memcpy(dst_p + dst_bv.bv_offset,
-		       src_p + src_bv.bv_offset,
-		       bytes);
-
-		kunmap_atomic(dst_p);
-		kunmap_atomic(src_p);
-
-		flush_dcache_page(dst_bv.bv_page);
+		memcpy(dst_bv.bv_addr, src_bv.bv_addr, bytes);
 
 		bio_advance_iter(src, src_iter, bytes);
 		bio_advance_iter(dst, dst_iter, bytes);
@@ -109,15 +106,11 @@ void bio_copy_data(struct bio *dst, struct bio *src)
 
 void zero_fill_bio_iter(struct bio *bio, struct bvec_iter start)
 {
-	unsigned long flags;
 	struct bio_vec bv;
 	struct bvec_iter iter;
 
-	__bio_for_each_segment(bv, bio, iter, start) {
-		char *data = bvec_kmap_irq(&bv, &flags);
-		memset(data, 0, bv.bv_len);
-		bvec_kunmap_irq(data, &flags);
-	}
+	__bio_for_each_segment(bv, bio, iter, start)
+		memset(bv.bv_addr, 0, bv.bv_len);
 }
 
 static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
@@ -165,15 +158,6 @@ struct bio *bio_split(struct bio *bio, int sectors,
 	return split;
 }
 
-void bio_free_pages(struct bio *bio)
-{
-	struct bvec_iter_all iter;
-	struct bio_vec *bvec;
-
-	bio_for_each_segment_all(bvec, bio, iter)
-		__free_page(bvec->bv_page);
-}
-
 void bio_advance(struct bio *bio, unsigned bytes)
 {
 	bio_advance_iter(bio, &bio->bi_iter, bytes);
@@ -208,21 +192,18 @@ void bio_put(struct bio *bio)
 	}
 }
 
-int bio_add_page(struct bio *bio, struct page *page,
-		 unsigned int len, unsigned int off)
+void bio_add_virt_nofail(struct bio *bio, void *vaddr, unsigned len)
 {
 	struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt];
 
 	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
 	WARN_ON_ONCE(bio->bi_vcnt >= bio->bi_max_vecs);
 
-	bv->bv_page = page;
-	bv->bv_offset = off;
+	bv->bv_addr = vaddr;
 	bv->bv_len = len;
 
 	bio->bi_iter.bi_size += len;
 	bio->bi_vcnt++;
-	return len;
 }
 
 static inline bool bio_remaining_done(struct bio *bio)
@@ -301,7 +282,7 @@ struct bio *bio_kmalloc(unsigned int nr_iovecs, gfp_t gfp_mask)
 		      sizeof(struct bio_vec) * nr_iovecs, gfp_mask);
 	if (unlikely(!bio))
 		return NULL;
-	bio_init(bio, NULL, nr_iovecs ? bio->bi_inline_vecs : NULL, nr_iovecs, 0);
+	bio_init(bio, NULL, nr_iovecs ? bio_inline_vecs(bio) : NULL, nr_iovecs, 0);
 	bio->bi_pool = NULL;
 	return bio;
 }
@@ -315,7 +296,7 @@ struct bio *bio_alloc(struct block_device *bdev, unsigned nr_iovecs,
 		      sizeof(struct bio_vec) * nr_iovecs, gfp_mask);
 	if (unlikely(!bio))
 		return NULL;
-	bio_init(bio, bdev, nr_iovecs ? bio->bi_inline_vecs : NULL, nr_iovecs, opf);
+	bio_init(bio, bdev, nr_iovecs ? bio_inline_vecs(bio) : NULL, nr_iovecs, opf);
 	bio->bi_pool = NULL;
 	return bio;
 }
@@ -367,7 +348,7 @@ struct bio *bio_alloc_bioset(struct block_device *bdev,
 
 		bio_init(bio, bdev, bvl, nr_iovecs, opf);
 	} else if (nr_iovecs) {
-		bio_init(bio, bdev, bio->bi_inline_vecs, BIO_INLINE_VECS, opf);
+		bio_init(bio, bdev, bio_inline_vecs(bio), BIO_INLINE_VECS, opf);
 	} else {
 		bio_init(bio, bdev, NULL, 0, opf);
 	}
@@ -406,4 +387,19 @@ int bioset_init(struct bio_set *bs,
 	if (ret)
 		bioset_exit(bs);
 	return ret;
+}
+
+struct bio_set fs_bio_set;
+
+__attribute__((constructor))
+static void fs_bio_set_init(void)
+{
+	if (bioset_init(&fs_bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS))
+		BUG();
+}
+
+__attribute__((destructor))
+static void fs_bio_set_exit(void)
+{
+	bioset_exit(&fs_bio_set);
 }

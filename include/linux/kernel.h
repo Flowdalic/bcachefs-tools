@@ -3,16 +3,68 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <limits.h>
 
 #include <linux/bug.h>
-#include <linux/byteorder.h>
+#include <linux/cache.h>
+#include <linux/cleanup.h>
 #include <linux/compiler.h>
-#include <linux/math.h>
-#include <linux/minmax.h>
+#include <linux/dcache.h>
+#include <linux/kmsan-checks.h>
+#include <linux/static_key.h>
+
+#define BITS_PER_LONG	__BITS_PER_LONG
+
+struct page;
+struct kmem_cache;
+
+typedef unsigned long		pgoff_t;
+
+typedef unsigned short		umode_t;
+
+typedef unsigned gfp_t;
+
+#define GFP_ATOMIC	0
+#define GFP_NOFS	0
+#define GFP_NOIO	0
+#define GFP_NOWAIT	0
+#define __GFP_RECLAIM	0
+#define __GFP_FS	0
+#define __GFP_IO	0
+#define __GFP_NOWARN	0
+#define __GFP_NORETRY	0
+#define __GFP_NOFAIL	0
+#define __GFP_ACCOUNT	0
+#define __GFP_RECLAIMABLE 0
+#define __GFP_ZERO	1
+#define __GFP_SKIP_ZERO	0
+#define GFP_KERNEL	2
+
+#define PAGE_ALLOC_COSTLY_ORDER	6
+
+typedef __u64 u64;
+typedef __s64 s64;
+typedef unsigned __int128 u128;
+typedef __u32 u32;
+typedef __s32 s32;
+typedef __u16 u16;
+typedef __s16 s16;
+typedef __u8  u8;
+typedef __s8  s8;
+
+typedef unsigned char		unchar;
+typedef unsigned short		ushort;
+typedef unsigned int		uint;
+typedef unsigned long		ulong;
+typedef unsigned long long	ullong;
 
 #define BIT(nr)			(1UL << (nr))
 #define BIT_ULL(nr)		(1ULL << (nr))
@@ -198,12 +250,12 @@ int __must_check kstrtoint(const char *s, unsigned int base, int *res);
 
 static inline int __must_check kstrtou64(const char *s, unsigned int base, u64 *res)
 {
-	return kstrtoull(s, base, res);
+	return kstrtoull(s, base, (unsigned long long *)res);
 }
 
 static inline int __must_check kstrtos64(const char *s, unsigned int base, s64 *res)
 {
-	return kstrtoll(s, base, res);
+	return kstrtoll(s, base, (long long *)res);
 }
 
 static inline int __must_check kstrtou32(const char *s, unsigned int base, u32 *res)
@@ -250,8 +302,6 @@ struct qstr {
 
 #define POISON_FREE 0x6b
 
-static inline void dump_stack(void) {}
-
 #define unsafe_memcpy(dst, src, bytes, justification)		\
 	memcpy(dst, src, bytes)
 
@@ -260,5 +310,30 @@ static inline void dump_stack(void) {}
 #else
 #define DECLARE_FLEX_ARRAY(T, member)        T member[0]
 #endif
+
+typedef u64 sector_t;
+
+typedef void (*swap_r_func_t)(void *a, void *b, int size, const void *priv);
+typedef void (*swap_func_t)(void *a, void *b, int size);
+
+typedef int (*cmp_r_func_t)(const void *a, const void *b, const void *priv);
+typedef int (*cmp_func_t)(const void *a, const void *b);
+
+typedef unsigned int __bitwise slab_flags_t;
+typedef u64 phys_addr_t;
+struct vm_struct;
+struct mnt_idmap;
+
+#include <linux/math.h>
+#include <linux/minmax.h>
+#include <linux/byteorder.h>
+
+#define __cold
+
+static inline size_t copy_to_user(void *dst, void *src, size_t len)
+{
+	memcpy(dst, src, len);
+	return 0;
+}
 
 #endif

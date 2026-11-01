@@ -14,8 +14,10 @@ fn main() {
     println!("cargo:rustc-link-lib=udev");
     println!("cargo:rustc-link-lib=keyutils");
     println!("cargo:rustc-link-lib=aio");
+    println!("cargo:rustc-link-lib=unwind");
 
-    if std::env::var("BCACHEFS_FUSE").is_ok() {
-        println!("cargo:rustc-link-lib=fuse3");
-    }
+    // Export static symbols for dladdr() in tools-side prt_addr_symbol
+    println!("cargo:rustc-link-arg-bins=-rdynamic");
+
+    // fuser crate talks to /dev/fuse directly — no libfuse3 needed
 }

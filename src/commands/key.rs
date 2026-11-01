@@ -1,0 +1,176 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use bcachefs_kernel::c::{bch_key, bch_encrypted_key};
+use bch_bindgen::c;
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::opt_set;
+use bch_bindgen::sb::io as sb_io;
+use clap::Parser;
+
+use crate::key::{sb_is_encrypted, KeyHandle, Keyring, Passphrase, PassphraseCorrect};
+
+// ---- unlock ----
+
+#[derive(Parser, Debug)]
+#[command(about = "Unlock an encrypted filesystem prior to running/mounting")]
+pub struct UnlockCli {
+    /// Report the device's encryption and lock state, then exit
+    #[arg(short, long)]
+    check: bool,
+
+    /// Keyring to add to
+    #[arg(short, long, default_value = "user")]
+    keyring: Keyring,
+
+    /// Passphrase file to read from (disables passphrase prompt)
+    #[arg(short, long)]
+    file: Option<PathBuf>,
+
+    /// Device
+    device: String,
+}
+
+fn cmd_unlock(cli: UnlockCli) -> Result<()> {
+
+    let sb = sb_io::read_super(Path::new(&cli.device))
+        .with_context(|| format!("Error opening {}", cli.device))?;
+
+    let encrypted = sb_is_encrypted(&sb);
+
+    // --check reports state without prompting or unlocking. "Unlocked" means
+    // the key for this filesystem's UUID is already present in a keyring.
+    if cli.check {
+        if !encrypted {
+            println!("Device has no encryption");
+            // Exit nonzero on the unencrypted case. Boot scripts (notably the
+            // NixOS initramfs) branch on --check's exit code to decide whether
+            // to prompt for unlock; returning 0 here makes an unencrypted root
+            // read as "needs unlocking" and prompt for a nonexistent passphrase.
+            // Encrypted (locked or unlocked) still exits 0, matching the
+            // behaviour from before --check grew the three-state output.
+            std::process::exit(1);
+        } else if KeyHandle::new_from_search(&sb.sb().uuid()).is_ok() {
+            println!("Device is encrypted and unlocked");
+        } else {
+            println!("Device is encrypted and locked");
+        }
+        return Ok(());
+    }
+
+    if !encrypted {
+        bail!("{} is not encrypted", cli.device);
+    }
+
+    let passphrase_correct = match cli.file {
+        Some(ref file) => Passphrase::read_from_file(file)?
+            .check(&sb)
+            .ok_or_else(|| anyhow!("incorrect passphrase"))?,
+        None => Passphrase::ask_and_check(&sb)?,
+    };
+    KeyHandle::new(&passphrase_correct, cli.keyring)?;
+
+    Ok(())
+}
+
+// ---- shared helpers for set/remove-passphrase ----
+
+fn parse_device_list(args: &[String]) -> Vec<PathBuf> {
+    if args.len() == 1 && args[0].contains(':') {
+        args[0].split(':').map(PathBuf::from).collect()
+    } else {
+        args.iter().map(PathBuf::from).collect()
+    }
+}
+
+/// Open a filesystem with nostart for superblock modification.
+fn open_nostart(devs: &[PathBuf]) -> Result<Fs> {
+    let mut opts = c::bch_opts::default();
+    opt_set!(opts, nostart, 1);
+    crate::device_scan::open_scan(devs, opts)
+        .map_err(|e| anyhow::anyhow!("Error opening {:?}: {}", devs, e))
+}
+
+/// Open filesystem, verify encryption is enabled, and obtain the raw key.
+///
+/// If the key is encrypted (passphrase-protected), prompts for and verifies
+/// the current passphrase. If the key is unencrypted (formatted with
+/// --no_passphrase), reads the raw key directly.
+fn open_and_verify(devs: &[PathBuf]) -> Result<(Fs, bch_key)> {
+    let fs = open_nostart(devs)?;
+    let sb_handle = fs.sb_handle();
+
+    if sb_handle.sb().crypt().is_none() {
+        bail!("Filesystem does not have encryption enabled");
+    }
+
+    if sb_is_encrypted(sb_handle) {
+        let PassphraseCorrect { cleartext_sb_key, .. } =
+            Passphrase::ask_and_check(sb_handle)?;
+        Ok((fs, cleartext_sb_key.into_key()))
+    } else {
+        let raw_key = sb_handle.sb().crypt().unwrap().key().key.clone();
+        Ok((fs, raw_key))
+    }
+}
+
+/// Write a new encrypted key to the crypt superblock field.
+///
+/// # Safety
+/// Caller must hold sb_lock.
+unsafe fn set_crypt_key(fs: &Fs, key: c::bch_encrypted_key) {
+    let disk_sb = &mut (*fs.raw).disk_sb;
+    let crypt: &mut c::bch_sb_field_crypt = bcachefs_kernel::sb::io::sb_field_get_mut(disk_sb)
+        .expect("filesystem has no crypt field");
+    crypt.key = key;
+}
+
+// ---- set-passphrase ----
+
+#[derive(Parser, Debug)]
+#[command(about = "Change passphrase on an existing encrypted (unmounted) filesystem")]
+pub struct SetPassphraseCli {
+    /// Devices (colon-separated or multiple arguments)
+    #[arg(required = true)]
+    devices: Vec<String>,
+}
+
+fn cmd_set_passphrase(cli: SetPassphraseCli) -> Result<()> {
+    let (fs, raw_key) = open_and_verify(&parse_device_list(&cli.devices))?;
+
+    let new_passphrase = Passphrase::ask_for_new_passphrase()
+        .context("reading new passphrase")?;
+
+    let encrypted_key = new_passphrase.encrypt_key(fs.sb_handle(), raw_key);
+
+    unsafe {
+        set_crypt_key(&fs, encrypted_key);
+        c::bch2_revoke_key(fs.sb_handle().sb);
+    }
+    fs.write_super();
+
+    Ok(())
+}
+
+// ---- remove-passphrase ----
+
+#[derive(Parser, Debug)]
+#[command(about = "Remove passphrase protection from an existing encrypted (unmounted) filesystem")]
+pub struct RemovePassphraseCli {
+    /// Devices (colon-separated or multiple arguments)
+    #[arg(required = true)]
+    devices: Vec<String>,
+}
+
+fn cmd_remove_passphrase(cli: RemovePassphraseCli) -> Result<()> {
+    let (fs, raw_key) = open_and_verify(&parse_device_list(&cli.devices))?;
+
+    unsafe { set_crypt_key(&fs, bch_encrypted_key::new_unencrypted(raw_key)); }
+    fs.write_super();
+
+    Ok(())
+}
+
+pub const CMD_UNLOCK: super::CmdDef = typed_cmd!("unlock", "Unlock an encrypted filesystem", UnlockCli, cmd_unlock);
+pub const CMD_SET_PASSPHRASE: super::CmdDef = typed_cmd!("set-passphrase", "Set or change encryption passphrase", SetPassphraseCli, cmd_set_passphrase);
+pub const CMD_REMOVE_PASSPHRASE: super::CmdDef = typed_cmd!("remove-passphrase", "Remove encryption passphrase", RemovePassphraseCli, cmd_remove_passphrase);

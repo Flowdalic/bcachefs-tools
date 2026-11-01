@@ -9,7 +9,9 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/bug.h>
+#include <linux/kernel.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 
 #ifdef SYS_getrandom
 static inline int getrandom(void *buf, size_t buflen, unsigned int flags)
@@ -64,6 +66,26 @@ static inline u32 get_random_u32_below(u32 ceil)
 			if (likely(is_power_of_2(ceil) || (u32)mult >= -ceil % ceil))
 				return mult >> 32;
 		}
+	}
+}
+
+static inline u32 __get_random_u32_below(u32 ceil)
+{
+	return get_random_u32_below(ceil);
+}
+
+static inline u64 get_random_u64_below(u64 ceil)
+{
+	if (ceil <= 1)
+		return 0;
+	if (ceil <= U32_MAX)
+		return get_random_u32_below(ceil);
+
+	for (;;) {
+		u64 rand = get_random_u64();
+		u64 mult = ceil * rand;
+		if (likely(mult >= -ceil % ceil))
+			return mul_u64_u64_shr(ceil, rand, 64);
 	}
 }
 

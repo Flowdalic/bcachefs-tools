@@ -11,19 +11,21 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
 
-    fenix = {
-      url = "github:nix-community/fenix";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
+    };
+
+    nix-github-actions = {
+      url = "github:nix-community/nix-github-actions";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
@@ -33,19 +35,49 @@
       nixpkgs,
       flake-parts,
       treefmt-nix,
-      fenix,
       crane,
-      ...
+      rust-overlay,
+      flake-compat,
+      nix-github-actions,
     }:
+    let
+      # i686-linux dropped: no real consumers, and cross sqlite tcltest
+      # tries to run on i686 and fails.
+      systems = nixpkgs.lib.filter
+        (s: nixpkgs.lib.hasSuffix "-linux" s && s != "i686-linux")
+        nixpkgs.lib.systems.flakeExposed;
+
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      rustfmtToml = builtins.fromTOML (builtins.readFile ./rustfmt.toml);
+
+      rev = self.shortRev or self.dirtyShortRev or (nixpkgs.lib.substring 0 8 self.lastModifiedDate);
+      version = "${cargoToml.package.version}+${rev}";
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ inputs.treefmt-nix.flakeModule ];
 
-      # can be extended, but these have proper binary cache support in nixpkgs
-      # as of writing.
-      systems = [
-        "aarch64-linux"
-        "x86_64-linux"
-        "i686-linux"
+      flake = {
+        githubActions = nix-github-actions.lib.mkGithubMatrix {
+          # github actions supports fewer architectures
+          checks = nixpkgs.lib.getAttrs [ "aarch64-linux" "x86_64-linux" ] self.checks;
+        };
+        nixosModules = let
+          bcachefsNixosModule = { pkgs, ... }: {
+            boot.supportedFilesystems = [ "bcachefs" ];
+            boot.bcachefs.package =
+              (pkgs.extend self.overlays.default).bcachefsPackages.bcachefs-tools;
+          };
+        in {
+          default = bcachefsNixosModule;
+          bcachefs = bcachefsNixosModule;
+        };
+      };
+
+      inherit systems;
+
+      flake.overlays.default = nixpkgs.lib.composeManyExtensions [
+        (import rust-overlay)
+        (import ./overlay.nix { inherit inputs version; })
       ];
 
       perSystem =
@@ -53,133 +85,108 @@
           self',
           config,
           lib,
-          pkgs,
           system,
           ...
         }:
         let
-          inherit (builtins) readFile split;
-          inherit (lib.lists) findFirst;
-          inherit (lib.strings) hasPrefix removePrefix substring;
-
-          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-          rustfmtToml = builtins.fromTOML (builtins.readFile ./rustfmt.toml);
-
-          craneLib = crane.mkLib pkgs;
-
-          rev = self.shortRev or self.dirtyShortRev or (substring 0 8 self.lastModifiedDate);
-          makefileVersion = removePrefix "VERSION=" (
-            findFirst (line: hasPrefix "VERSION=" line) "VERSION=0.0.0" (split "\n" (readFile ./Makefile))
-          );
-          version = "${makefileVersion}+${rev}";
-
-          commonArgs = {
-            inherit version;
-            src = self;
-
-            env = {
-              PKG_CONFIG_SYSTEMD_SYSTEMDSYSTEMUNITDIR = "${placeholder "out"}/lib/systemd/system";
-              PKG_CONFIG_UDEV_UDEVDIR = "${placeholder "out"}/lib/udev";
-            };
-
-            makeFlags = [
-              "INITRAMFS_DIR=${placeholder "out"}/etc/initramfs-tools"
-              "PREFIX=${placeholder "out"}"
-              "VERSION=${version}"
-            ];
-
-            dontStrip = true;
-
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              rustPlatform.bindgenHook
-            ];
-
-            buildInputs = with pkgs; [
-              attr
-              keyutils
-              libaio
-              libsodium
-              liburcu
-              libuuid
-              lz4
-              udev
-              zlib
-              zstd
-            ];
-
-            meta = {
-              description = "Userspace tools for bcachefs";
-              license = lib.licenses.gpl2Only;
-              mainProgram = "bcachefs";
-            };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ self.overlays.default ];
           };
-
-          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { pname = cargoToml.package.name; });
+          latexDerivation = (
+            pkgs.texliveBasic.withPackages (
+              ps: with ps; [
+                imakeidx
+                xkeyval
+                upquote
+                collection-fontsrecommended
+              ]
+            )
+          );
         in
         {
-          packages.default = config.packages.bcachefs-tools;
-          packages.bcachefs-tools = craneLib.buildPackage (
-            commonArgs
+          packages =
+            let
+              packagesForSystem =
+                crossSystem:
+                let
+                  localSystem = system;
+                  pkgs' = import nixpkgs {
+                    inherit crossSystem localSystem;
+                    overlays = [ self.overlays.default ];
+                  };
+
+                  withCrossName =
+                    set: lib.mapAttrs' (name: value: lib.nameValuePair "${name}-${crossSystem}" value) set;
+                in
+                (withCrossName pkgs'.bcachefsPackages)
+                // lib.optionalAttrs (crossSystem == localSystem) pkgs'.bcachefsPackages;
+              packages = lib.mergeAttrsList (map packagesForSystem systems);
+            in
+            packages
             // {
-              inherit cargoArtifacts;
+              default = self'.packages.${cargoToml.package.name};
+              doc = pkgs.stdenv.mkDerivation {
+                pname = "bcachefs-tools-doc";
+                inherit version;
+                src = ./doc;
+                buildInputs = with pkgs; [
+                  latexDerivation
+                ];
+                buildPhase = ''
+                  pdflatex bcachefs-principles-of-operation.tex
+                  pdflatex bcachefs-principles-of-operation.tex
+                '';
+                installPhase = ''
+                  mkdir -p $out/doc
+                  cp bcachefs-principles-of-operation.pdf $out/doc
+                '';
+              };
+            };
 
-              enableParallelBuilding = true;
-              buildPhaseCargoCommand = ''
-                make ''${enableParallelBuilding:+-j''${NIX_BUILD_CORES}} $makeFlags
-              '';
-              installPhaseCommand = ''
-                make ''${enableParallelBuilding:+-j''${NIX_BUILD_CORES}} $makeFlags install
-              '';
+          checks = {
+            inherit (self'.packages)
+              bcachefs-tools
+              bcachefs-tools-aarch64-linux
+              bcachefs-tools-fuse
+              bcachefs-module-linux-latest
+              bcachefs-module-linux-testing
+              ;
+            inherit (pkgs.callPackage ./crane-build.nix { inherit crane version; })
+              # cargo-clippy
+              cargo-test
+              ;
 
-              doInstallCheck = true;
-              installCheckPhase = ''
-                runHook preInstallCheck
+            # cargo clippy with the current minimum supported rust version
+            # according to Cargo.toml
+            msrv =
+              let
+                rustVersion = cargoToml.package.rust-version;
+                craneBuild = pkgs.callPackage ./crane-build.nix { inherit crane rustVersion version; };
+              in
+              craneBuild.cargo-test.overrideAttrs (
+                final: prev: {
+                  pname = "${prev.pname}-msrv";
+                }
+              );
 
-                test "$($out/bin/bcachefs version)" = "${version}"
-
-                runHook postInstallCheck
-              '';
-            }
-          );
-
-          packages.bcachefs-tools-fuse = config.packages.bcachefs-tools.overrideAttrs (
-            final: prev: {
-              makeFlags = prev.makeFlags ++ [ "BCACHEFS_FUSE=1" ];
-              buildInputs = prev.buildInputs ++ [ pkgs.fuse3 ];
-            }
-          );
-
-          checks.cargo-clippy = craneLib.cargoClippy (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            }
-          );
-
-          # we have to build our own `craneLib.cargoTest`
-          checks.cargo-test = craneLib.mkCargoDerivation (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              doCheck = true;
-
-              enableParallelChecking = true;
-
-              pnameSuffix = "-test";
-              buildPhaseCargoCommand = "";
-              checkPhaseCargoCommand = ''
-                make ''${enableParallelChecking:+-j''${NIX_BUILD_CORES}} $makeFlags libbcachefs.a
-                cargo test --profile release -- --nocapture
-              '';
-            }
-          );
+            # The test derivation hardcodes "kvm" into requiredSystemFeatures
+            # for any Linux test, which GitHub's hosted aarch64 runners don't
+            # provide — so it won't schedule there. Strip it via
+            # overrideTestDerivation (overrideAttrs for the test): qemu.forceAccel
+            # defaults to false, so the driver falls back to TCG emulation when
+            # /dev/kvm is absent (KVM used where available, emulated otherwise).
+            nixos-test =
+              (pkgs.testers.nixosTest (import ./nixos-test.nix self')).overrideTestDerivation
+                (_: prev: {
+                  requiredSystemFeatures = lib.remove "kvm" (prev.requiredSystemFeatures or [ ]);
+                });
+          };
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [
-              config.packages.default
               config.treefmt.build.devShell
+              self'.packages.default
             ];
 
             # here go packages that aren't required for builds but are used for
@@ -187,12 +194,22 @@
             # dependencies (e.g. clippy or rust-analyzer).
             packages = with pkgs; [
               bear
+              rust-bindgen
               cargo-audit
               cargo-outdated
               clang-tools
-              clippy
-              rust-analyzer
-              rustc
+              (rust-bin.stable.latest.minimal.override {
+                extensions = [
+                  "rust-analyzer"
+                  "rust-src"
+                ];
+              })
+            ];
+          };
+
+          devShells.doc = pkgs.mkShell {
+            packages = with pkgs; [
+              latexDerivation
             ];
           };
 
@@ -204,7 +221,7 @@
               nixfmt.enable = true;
               rustfmt.edition = rustfmtToml.edition;
               rustfmt.enable = true;
-              rustfmt.package = fenix.packages.${system}.default.rustfmt;
+              rustfmt.package = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt);
             };
           };
         };

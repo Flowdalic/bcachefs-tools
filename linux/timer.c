@@ -129,7 +129,7 @@ struct pending_timer {
 static inline bool pending_timer_cmp(struct pending_timer a,
 				     struct pending_timer b)
 {
-	return a.expires < b.expires;
+	return time_after(a.expires, b.expires);
 }
 
 static DECLARE_HEAP(struct pending_timer) pending_timers;
@@ -182,7 +182,7 @@ void flush_timers(void)
 	pthread_mutex_unlock(&timer_lock);
 }
 
-int del_timer_sync(struct timer_list *timer)
+int timer_delete_sync(struct timer_list *timer)
 {
 	unsigned long seq;
 	ssize_t idx;
@@ -202,11 +202,59 @@ int del_timer_sync(struct timer_list *timer)
 	return idx >= 0;
 }
 
+static int timer_thread(void *arg)
+{
+	pthread_mutex_lock(&timer_lock);
+
+	while (true) {
+		unsigned long now = jiffies;
+		struct pending_timer *p = heap_peek(&pending_timers);
+
+		if (!p) {
+			pthread_cond_wait(&timer_cond, &timer_lock);
+		} else if (time_after_eq(now, p->expires)) {
+			struct timer_list *timer = p->timer;
+
+			heap_del(&pending_timers, 0, pending_timer_cmp);
+			BUG_ON(!timer_pending(timer));
+			timer->pending = false;
+
+			timer_seq++;
+			BUG_ON(!timer_running());
+
+			pthread_mutex_unlock(&timer_lock);
+			timer->function(timer);
+			pthread_mutex_lock(&timer_lock);
+
+			timer_seq++;
+			pthread_cond_broadcast(&timer_running_cond);
+		} else {
+			struct timespec ts;
+			BUG_ON(clock_gettime(CLOCK_REALTIME, &ts));
+			ts = timespec_add_ns(ts, jiffies_to_nsecs(p->expires - now));
+
+			pthread_cond_timedwait(&timer_cond, &timer_lock, &ts);
+		}
+	}
+
+	pthread_mutex_unlock(&timer_lock);
+
+	return 0;
+}
+
+static struct task_struct *timer_task;
+
 int mod_timer(struct timer_list *timer, unsigned long expires)
 {
 	ssize_t idx;
 
 	pthread_mutex_lock(&timer_lock);
+
+	if (!timer_task) {
+		timer_task = kthread_run(timer_thread, NULL, "timers");
+		BUG_ON(IS_ERR(timer_task));
+	}
+
 	timer->expires = expires;
 	timer->pending = true;
 	idx = timer_idx(timer);
@@ -246,84 +294,9 @@ out:
 	return idx >= 0;
 }
 
-static bool timer_thread_stop = false;
-
-static int timer_thread(void *arg)
-{
-	struct pending_timer *p;
-	struct timespec ts;
-	unsigned long now;
-	int ret;
-
-	pthread_mutex_lock(&timer_lock);
-
-	while (!timer_thread_stop) {
-		now = jiffies;
-		p = heap_peek(&pending_timers);
-
-		if (!p) {
-			pthread_cond_wait(&timer_cond, &timer_lock);
-			continue;
-		}
-
-		if (time_after_eq(now, p->expires)) {
-			struct timer_list *timer = p->timer;
-
-			heap_del(&pending_timers, 0, pending_timer_cmp);
-			BUG_ON(!timer_pending(timer));
-			timer->pending = false;
-
-			timer_seq++;
-			BUG_ON(!timer_running());
-
-			pthread_mutex_unlock(&timer_lock);
-			timer->function(timer);
-			pthread_mutex_lock(&timer_lock);
-
-			timer_seq++;
-			pthread_cond_broadcast(&timer_running_cond);
-			continue;
-		}
-
-
-		ret = clock_gettime(CLOCK_REALTIME, &ts);
-		BUG_ON(ret);
-
-		ts = timespec_add_ns(ts, jiffies_to_nsecs(p->expires - now));
-
-		pthread_cond_timedwait(&timer_cond, &timer_lock, &ts);
-	}
-
-	pthread_mutex_unlock(&timer_lock);
-
-	return 0;
-}
-
-struct task_struct *timer_task;
-
 __attribute__((constructor(103)))
 static void timers_init(void)
 {
 	heap_init(&pending_timers, 64);
 	BUG_ON(!pending_timers.data);
-
-	timer_task = kthread_run(timer_thread, NULL, "timers");
-	BUG_ON(IS_ERR(timer_task));
-}
-
-__attribute__((destructor(103)))
-static void timers_cleanup(void)
-{
-	get_task_struct(timer_task);
-
-	pthread_mutex_lock(&timer_lock);
-	timer_thread_stop = true;
-	pthread_cond_signal(&timer_cond);
-	pthread_mutex_unlock(&timer_lock);
-
-	int ret = kthread_stop(timer_task);
-	BUG_ON(ret);
-
-	put_task_struct(timer_task);
-	timer_task = NULL;
 }

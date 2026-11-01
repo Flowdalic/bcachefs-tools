@@ -129,8 +129,8 @@ static void swap_bytes(void *a, void *b, size_t n)
 #define SWAP_WRAPPER  (swap_r_func_t)3
 
 struct wrapper {
-	cmp_func_t cmp;
-	swap_func_t swap;
+	cmp_func_t	cmp_fn;
+	swap_func_t	swap_fn;
 };
 
 /*
@@ -140,7 +140,7 @@ struct wrapper {
 static void do_swap(void *a, void *b, size_t size, swap_r_func_t swap_func, const void *priv)
 {
 	if (swap_func == SWAP_WRAPPER) {
-		((const struct wrapper *)priv)->swap(a, b, (int)size);
+		((const struct wrapper *)priv)->swap_fn(a, b, (int)size);
 		return;
 	}
 
@@ -159,7 +159,7 @@ static void do_swap(void *a, void *b, size_t size, swap_r_func_t swap_func, cons
 static int do_cmp(const void *a, const void *b, cmp_r_func_t cmp, const void *priv)
 {
 	if (cmp == _CMP_WRAPPER)
-		return ((const struct wrapper *)priv)->cmp(a, b);
+		return ((const struct wrapper *)priv)->cmp_fn(a, b);
 	return cmp(a, b, priv);
 }
 
@@ -221,7 +221,7 @@ void sort_r(void *base, size_t num, size_t size,
 		return;
 
 	/* called from 'sort' without swap function, let's pick the default */
-	if (swap_func == SWAP_WRAPPER && !((struct wrapper *)priv)->swap)
+	if (swap_func == SWAP_WRAPPER && !((struct wrapper *)priv)->swap_fn)
 		swap_func = NULL;
 
 	if (!swap_func) {

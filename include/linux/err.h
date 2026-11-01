@@ -1,6 +1,8 @@
 #ifndef __TOOLS_LINUX_ERR_H
 #define __TOOLS_LINUX_ERR_H
 
+#include <stdbool.h>
+
 #include <linux/compiler.h>
 #include <linux/types.h>
 

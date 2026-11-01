@@ -2,6 +2,7 @@
 #define __TOOLS_LINUX_SPINLOCK_H
 
 #include <linux/atomic.h>
+#include <linux/bug.h>
 #include <pthread.h>
 
 typedef struct {
@@ -61,5 +62,6 @@ typedef raw_spinlock_t spinlock_t;
 
 #define spin_lock_irqsave(lock, flags)	raw_spin_lock_irqsave(lock, flags)
 #define spin_unlock_irqrestore(lock, flags) raw_spin_unlock_irqrestore(lock, flags)
+#define spin_trylock(lock)		raw_spin_trylock(lock)
 
 #endif /* __TOOLS_LINUX_SPINLOCK_H */

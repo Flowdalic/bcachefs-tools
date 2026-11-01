@@ -27,6 +27,7 @@ struct task_struct;
 
 #define lockdep_assert_held(l)			do { (void)(l); } while (0)
 #define lockdep_assert_held_once(l)		do { (void)(l); } while (0)
+#define lockdep_assert_not_held(l)		do { (void)(l); } while (0)
 
 #define lock_acquire_shared(l, s, t, n, i)
 
@@ -34,6 +35,8 @@ struct task_struct;
 
 #define lock_contended(lockdep_map, ip) do {} while (0)
 #define lock_acquired(lockdep_map, ip) do {} while (0)
+
+#define lock_set_cmp_fn(lock, ...)	do { } while (0)
 
 static inline void debug_show_all_locks(void)
 {

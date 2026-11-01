@@ -4,6 +4,7 @@
 #define _LINUX_PERCPU_RWSEM_H
 
 #include <pthread.h>
+#include <linux/cleanup.h>
 #include <linux/preempt.h>
 
 struct percpu_rw_semaphore {
@@ -54,5 +55,12 @@ static inline int percpu_init_rwsem(struct percpu_rw_semaphore *sem)
 }
 
 #define percpu_rwsem_assert_held(sem)		do {} while (0)
+
+DEFINE_GUARD(percpu_read, struct percpu_rw_semaphore *,
+	     percpu_down_read(_T), percpu_up_read(_T))
+DEFINE_GUARD_COND(percpu_read, _try, percpu_down_read_trylock(_T))
+
+DEFINE_GUARD(percpu_write, struct percpu_rw_semaphore *,
+	     percpu_down_write(_T), percpu_up_write(_T))
 
 #endif

@@ -6,9 +6,12 @@
 #define __LINUX_BLK_TYPES_H
 
 #include <linux/atomic.h>
+#include <linux/backing-dev.h>
 #include <linux/types.h>
 #include <linux/bvec.h>
 #include <linux/kobject.h>
+#include <linux/mutex.h>
+#include <linux/rwsem.h>
 
 struct bio_set;
 struct bio;
@@ -30,12 +33,15 @@ typedef unsigned int __bitwise blk_mode_t;
 #define BLK_OPEN_WRITE_IOCTL	((__force blk_mode_t)(1 << 4))
 
 #define BLK_OPEN_BUFFERED	((__force blk_mode_t)(1 << 5))
+#define BLK_OPEN_CREAT		((__force blk_mode_t)(1 << 6))
 
 struct inode {
 	unsigned long		i_ino;
 	loff_t			i_size;
 	struct super_block	*i_sb;
 	blk_mode_t		mode;
+	void			*i_private;
+	unsigned		i_state;
 };
 
 struct request_queue {
@@ -53,6 +59,11 @@ struct hd_struct {
 
 struct block_device {
 	struct kobject		kobj;
+
+	struct			{
+		struct kobject	kobj;
+	}			bd_device;
+
 	dev_t			bd_dev;
 	char			name[BDEVNAME_SIZE];
 	struct inode		*bd_inode;
@@ -62,6 +73,8 @@ struct block_device {
 	struct gendisk *	bd_disk;
 	struct gendisk		__bd_disk;
 	int			bd_fd;
+
+	struct mutex		bd_holder_lock;
 };
 
 #define bdev_kobj(_bdev) (&((_bdev)->kobj))
@@ -76,7 +89,7 @@ typedef u8 __bitwise blk_status_t;
 #define BLK_STS_NOSPC		((__force blk_status_t)3)
 #define BLK_STS_TRANSPORT	((__force blk_status_t)4)
 #define BLK_STS_TARGET		((__force blk_status_t)5)
-#define BLK_STS_NEXUS		((__force blk_status_t)6)
+#define BLK_STS_RESV_CONFLICT	((__force blk_status_t)6)
 #define BLK_STS_MEDIUM		((__force blk_status_t)7)
 #define BLK_STS_PROTECTION	((__force blk_status_t)8)
 #define BLK_STS_RESOURCE	((__force blk_status_t)9)
@@ -86,6 +99,12 @@ typedef u8 __bitwise blk_status_t;
 #define BLK_STS_DM_REQUEUE    ((__force blk_status_t)11)
 
 #define BLK_STS_AGAIN		((__force blk_status_t)12)
+#define BLK_STS_DEV_RESOURCE	((__force blk_status_t)13)
+#define BLK_STS_ZONE_OPEN_RESOURCE	((__force blk_status_t)14)
+#define BLK_STS_ZONE_ACTIVE_RESOURCE	((__force blk_status_t)15)
+#define BLK_STS_OFFLINE		((__force blk_status_t)16)
+#define BLK_STS_DURATION_LIMIT	((__force blk_status_t)17)
+#define BLK_STS_INVAL	((__force blk_status_t)19)
 
 #define BIO_INLINE_VECS 4
 
@@ -124,14 +143,12 @@ struct bio {
 	struct bio_vec		*bi_io_vec;	/* the actual vec list */
 
 	struct bio_set		*bi_pool;
-
-	/*
-	 * We can inline a number of vecs at the end of the bio, to avoid
-	 * double allocations for a small number of bio_vecs. This member
-	 * MUST obviously be kept at the very end of the bio.
-	 */
-	struct bio_vec		bi_inline_vecs[0];
 };
+
+static inline struct bio_vec *bio_inline_vecs(struct bio *bio)
+{
+	return (struct bio_vec *)(bio + 1);
+}
 
 #define BIO_RESET_BYTES		offsetof(struct bio, bi_max_vecs)
 
@@ -186,36 +203,42 @@ struct bio {
 #define REQ_OP_MASK	((1 << REQ_OP_BITS) - 1)
 #define REQ_FLAG_BITS	24
 
-enum req_opf {
+typedef __u32 __bitwise blk_opf_t;
+
+enum req_op {
 	/* read sectors from the device */
-	REQ_OP_READ		= 0,
+	REQ_OP_READ		= (__force blk_opf_t)0,
 	/* write sectors to the device */
-	REQ_OP_WRITE		= 1,
+	REQ_OP_WRITE		= (__force blk_opf_t)1,
 	/* flush the volatile write cache */
-	REQ_OP_FLUSH		= 2,
+	REQ_OP_FLUSH		= (__force blk_opf_t)2,
 	/* discard sectors */
-	REQ_OP_DISCARD		= 3,
-	/* get zone information */
-	REQ_OP_ZONE_REPORT	= 4,
+	REQ_OP_DISCARD		= (__force blk_opf_t)3,
 	/* securely erase sectors */
-	REQ_OP_SECURE_ERASE	= 5,
-	/* seset a zone write pointer */
-	REQ_OP_ZONE_RESET	= 6,
-	/* write the same sector many times */
-	REQ_OP_WRITE_SAME	= 7,
+	REQ_OP_SECURE_ERASE	= (__force blk_opf_t)5,
+	/* write data at the current zone write pointer */
+	REQ_OP_ZONE_APPEND	= (__force blk_opf_t)7,
 	/* write the zero filled sector many times */
-	REQ_OP_WRITE_ZEROES	= 8,
+	REQ_OP_WRITE_ZEROES	= (__force blk_opf_t)9,
+	/* Open a zone */
+	REQ_OP_ZONE_OPEN	= (__force blk_opf_t)10,
+	/* Close a zone */
+	REQ_OP_ZONE_CLOSE	= (__force blk_opf_t)11,
+	/* Transition a zone to full */
+	REQ_OP_ZONE_FINISH	= (__force blk_opf_t)13,
+	/* reset a zone write pointer */
+	REQ_OP_ZONE_RESET	= (__force blk_opf_t)15,
+	/* reset all the zone present on the device */
+	REQ_OP_ZONE_RESET_ALL	= (__force blk_opf_t)17,
 
-	/* SCSI passthrough using struct scsi_request */
-	REQ_OP_SCSI_IN		= 32,
-	REQ_OP_SCSI_OUT		= 33,
 	/* Driver private requests */
-	REQ_OP_DRV_IN		= 34,
-	REQ_OP_DRV_OUT		= 35,
+	REQ_OP_DRV_IN		= (__force blk_opf_t)34,
+	REQ_OP_DRV_OUT		= (__force blk_opf_t)35,
 
-	REQ_OP_LAST,
+	REQ_OP_LAST		= (__force blk_opf_t)36,
 };
 
+/* Keep cmd_flag_name[] in sync with the definitions below */
 enum req_flag_bits {
 	__REQ_FAILFAST_DEV =	/* no driver retries of device errors */
 		REQ_OP_BITS,
@@ -231,12 +254,49 @@ enum req_flag_bits {
 	__REQ_PREFLUSH,		/* request for cache flush */
 	__REQ_RAHEAD,		/* read ahead, can fail anytime */
 	__REQ_BACKGROUND,	/* background IO */
+	__REQ_NOWAIT,           /* Don't wait if request will block */
+	__REQ_POLLED,		/* caller polls for completion using bio_poll */
+	__REQ_ALLOC_CACHE,	/* allocate IO from cache if available */
+	__REQ_SWAP,		/* swap I/O */
+	__REQ_DRV,		/* for driver use */
+	__REQ_FS_PRIVATE,	/* for file system (submitter) use */
+	__REQ_ATOMIC,		/* for atomic write operations */
+	__REQ_P2PDMA,		/* contains P2P DMA pages */
+	/*
+	 * Command specific flags, keep last:
+	 */
+	/* for REQ_OP_WRITE_ZEROES: */
+	__REQ_NOUNMAP,		/* do not free blocks when zeroing */
+
 	__REQ_NR_BITS,		/* stops here */
 };
 
-#define REQ_SYNC		(1ULL << __REQ_SYNC)
-#define REQ_META		(1ULL << __REQ_META)
-#define REQ_PRIO		(1ULL << __REQ_PRIO)
+#define REQ_FAILFAST_DEV	\
+			(__force blk_opf_t)(1ULL << __REQ_FAILFAST_DEV)
+#define REQ_FAILFAST_TRANSPORT	\
+			(__force blk_opf_t)(1ULL << __REQ_FAILFAST_TRANSPORT)
+#define REQ_FAILFAST_DRIVER	\
+			(__force blk_opf_t)(1ULL << __REQ_FAILFAST_DRIVER)
+#define REQ_SYNC	(__force blk_opf_t)(1ULL << __REQ_SYNC)
+#define REQ_META	(__force blk_opf_t)(1ULL << __REQ_META)
+#define REQ_PRIO	(__force blk_opf_t)(1ULL << __REQ_PRIO)
+#define REQ_NOMERGE	(__force blk_opf_t)(1ULL << __REQ_NOMERGE)
+#define REQ_IDLE	(__force blk_opf_t)(1ULL << __REQ_IDLE)
+#define REQ_INTEGRITY	(__force blk_opf_t)(1ULL << __REQ_INTEGRITY)
+#define REQ_FUA		(__force blk_opf_t)(1ULL << __REQ_FUA)
+#define REQ_PREFLUSH	(__force blk_opf_t)(1ULL << __REQ_PREFLUSH)
+#define REQ_RAHEAD	(__force blk_opf_t)(1ULL << __REQ_RAHEAD)
+#define REQ_BACKGROUND	(__force blk_opf_t)(1ULL << __REQ_BACKGROUND)
+#define REQ_NOWAIT	(__force blk_opf_t)(1ULL << __REQ_NOWAIT)
+#define REQ_POLLED	(__force blk_opf_t)(1ULL << __REQ_POLLED)
+#define REQ_ALLOC_CACHE	(__force blk_opf_t)(1ULL << __REQ_ALLOC_CACHE)
+#define REQ_SWAP	(__force blk_opf_t)(1ULL << __REQ_SWAP)
+#define REQ_DRV		(__force blk_opf_t)(1ULL << __REQ_DRV)
+#define REQ_FS_PRIVATE	(__force blk_opf_t)(1ULL << __REQ_FS_PRIVATE)
+#define REQ_ATOMIC	(__force blk_opf_t)(1ULL << __REQ_ATOMIC)
+#define REQ_P2PDMA	(__force blk_opf_t)(1ULL << __REQ_P2PDMA)
+
+#define REQ_NOUNMAP	(__force blk_opf_t)(1ULL << __REQ_NOUNMAP)
 
 #define REQ_NOMERGE_FLAGS	(REQ_PREFLUSH | REQ_FUA)
 
@@ -248,12 +308,6 @@ static inline void bio_set_op_attrs(struct bio *bio, unsigned op,
 {
 	bio->bi_opf = op | op_flags;
 }
-
-#define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
-#define REQ_THROTTLED		(1ULL << __REQ_THROTTLED)
-
-#define REQ_FUA			(1ULL << __REQ_FUA)
-#define REQ_PREFLUSH		(1ULL << __REQ_PREFLUSH)
 
 #define RW_MASK			REQ_OP_WRITE
 

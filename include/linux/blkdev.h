@@ -25,6 +25,7 @@ struct user_namespace;
 
 struct file {
 	struct inode		*f_inode;
+	void			*private_data;
 };
 
 static inline struct inode *file_inode(const struct file *f)
@@ -61,11 +62,21 @@ int blkdev_issue_zeroout(struct block_device *, sector_t, sector_t, gfp_t, unsig
 #define bdev_max_discard_sectors(bdev)	((void) (bdev), 0)
 #define blk_queue_nonrot(q)		((void) (q), 0)
 
+struct blk_plug {
+};
+
+static inline void blk_start_plug(struct blk_plug *plug) {}
+static inline void blk_finish_plug(struct blk_plug *plug) {}
+
 unsigned bdev_logical_block_size(struct block_device *bdev);
+bool bdev_nonrot(struct block_device *);
 sector_t get_capacity(struct gendisk *disk);
 
 struct blk_holder_ops {
-        void (*mark_dead)(struct block_device *bdev);
+        void (*mark_dead)(struct block_device *bdev, bool surprise);
+	void (*sync)(struct block_device *bdev);
+	int (*freeze)(struct block_device *bdev);
+	int (*thaw)(struct block_device *bdev);
 };
 
 static inline struct block_device *file_bdev(struct file *file)
@@ -80,7 +91,11 @@ int lookup_bdev(const char *path, dev_t *);
 
 struct super_block {
 	void			*s_fs_info;
+	struct rw_semaphore	s_umount;
 };
+
+static inline void evict_inodes(struct super_block *sb) {}
+static inline int sync_filesystem(struct super_block *sb) { return 0; }
 
 /*
  * File types
@@ -116,10 +131,11 @@ struct dir_context {
 	u64 pos;
 };
 
-/* /sys/fs */
-extern struct kobject *fs_kobj;
-
 struct file_operations {
+	struct module *owner;
+	int (*open) (struct inode *, struct file *);
+	int (*release) (struct inode *, struct file *);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
 };
 
 static inline int register_chrdev(unsigned int major, const char *name,
@@ -168,6 +184,10 @@ static inline bool dir_emit_dots(struct file *file, struct dir_context *ctx)
 int blk_status_to_errno(blk_status_t status);
 blk_status_t errno_to_blk_status(int errno);
 const char *blk_status_to_str(blk_status_t status);
+
+static inline void invalidate_bdev(struct block_device *bdev) {}
+
+void blkdev_init(void);
 
 #endif /* __TOOLS_LINUX_BLKDEV_H */
 

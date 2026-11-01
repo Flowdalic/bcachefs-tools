@@ -12,6 +12,8 @@ struct page;
 
 #endif
 
+static const size_t linux_page_size = PAGE_SIZE;
+
 #ifndef PAGE_SHIFT
 #define PAGE_SHIFT 12
 #endif

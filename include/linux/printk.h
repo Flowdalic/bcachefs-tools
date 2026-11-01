@@ -9,14 +9,15 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#define KERN_EMERG	""
-#define KERN_ALERT	""
-#define KERN_CRIT	""
-#define KERN_ERR	""
-#define KERN_WARNING	""
-#define KERN_NOTICE	""
-#define KERN_INFO	""
-#define KERN_DEBUG	""
+#define KERN_EMERG	KERN_SOH "0"	/* system is unusable */
+#define KERN_ALERT	KERN_SOH "1"	/* action must be taken immediately */
+#define KERN_CRIT	KERN_SOH "2"	/* critical conditions */
+#define KERN_ERR	KERN_SOH "3"	/* error conditions */
+#define KERN_WARNING	KERN_SOH "4"	/* warning conditions */
+#define KERN_NOTICE	KERN_SOH "5"	/* normal but significant condition */
+#define KERN_INFO	KERN_SOH "6"	/* informational */
+#define KERN_DEBUG	KERN_SOH "7"	/* debug-level messages */
+
 #define KERN_DEFAULT	""
 #define KERN_CONT	""
 #define KERN_SOH	"\001"
@@ -46,8 +47,8 @@ static inline int scnprintf(char * buf, size_t size, const char * fmt, ...)
 	return i;
 }
 
-#define printk(...)	printf(__VA_ARGS__)
-#define vprintk(...)	vprintf(__VA_ARGS__)
+void vprintk(const char *fmt, va_list args);
+void printk(const char *fmt, ...);
 
 #define no_printk(fmt, ...)				\
 ({							\
@@ -204,4 +205,7 @@ static inline int scnprintf(char * buf, size_t size, const char * fmt, ...)
 #define pr_devel_ratelimited(fmt, ...)					\
 	no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
 #endif
+
+void dump_stack(void);
+
 #endif /* __TOOLS_LINUX_PRINTK_H */
